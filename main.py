@@ -4,6 +4,7 @@ import sys
 import json
 import time
 import argparse
+import logging
 
 from cache import FileCache
 from rules import build_rules, resolve
@@ -21,6 +22,19 @@ def _add_cache_args(parser):
     )
 
 
+def _add_verbose_arg(parser):
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Log which tool handled each lookup (routing, cache, fallbacks) to stderr",
+    )
+
+
+def _setup_logging(verbose):
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG, format="[verbose] %(message)s", stream=sys.stderr)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
 def _make_cache(args):
     ttl = None if args.cache_ttl == 0 else args.cache_ttl * 3600
     cache = FileCache(args.cache_file) if args.cache_file else None
@@ -28,6 +42,7 @@ def _make_cache(args):
 
 
 def run_cli(args):
+    _setup_logging(args.verbose)
     cache, ttl = _make_cache(args)
     rules = build_rules(cache, ttl)
     delay = 0.0 if args.no_delay else args.delay
@@ -85,6 +100,7 @@ def run_serve(args):
         )
         sys.exit(1)
 
+    _setup_logging(args.verbose)
     cache, ttl = _make_cache(args)
     app = create_app(cache=cache, ttl=ttl)
     uvicorn.run(app, host=args.host, port=args.port)
@@ -102,12 +118,14 @@ def main():
     pipe.add_argument("--delay", type=float, default=1.0, metavar="SECONDS")
     pipe.add_argument("--no-delay", action="store_true")
     _add_cache_args(pipe)
+    _add_verbose_arg(pipe)
 
     # ── serve ───────────────────────────────────────
     serve = subparsers.add_parser("serve", help="Start HTTP API server")
     serve.add_argument("--host", default="0.0.0.0", metavar="HOST")
     serve.add_argument("--port", type=int, default=8000, metavar="PORT")
     _add_cache_args(serve)
+    _add_verbose_arg(serve)
 
     # Default to pipe mode when no subcommand is given, so that
     # `part-finder --no-delay` still works without typing "pipe".

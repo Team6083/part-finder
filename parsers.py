@@ -1,5 +1,6 @@
 import json
 import requests
+from decimal import Decimal, InvalidOperation
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
@@ -15,27 +16,52 @@ def _fetch(url, **kwargs):
     return r
 
 
+def format_price(amount) -> str:
+    """Normalize a decimal amount (str/int/Decimal) to a 2-decimal string."""
+    try:
+        return str(Decimal(str(amount)).quantize(Decimal("0.01")))
+    except (InvalidOperation, ValueError):
+        return str(amount)
+
+
+def format_cents(cents) -> str:
+    """Convert integer cents (Shopify .js prices) to a 2-decimal string, e.g. 999 -> '9.99'."""
+    try:
+        return str((Decimal(int(cents)) / 100).quantize(Decimal("0.01")))
+    except (TypeError, ValueError):
+        return ""
+
+
+def variant_name(title: str, variant_title: str) -> str:
+    if not variant_title or variant_title == "Default Title":
+        return title
+    return f"{title} – {variant_title}"
+
+
 def parse_shopify_rest(url) -> list[dict]:
-    """Fetch all variants of a Shopify product via the public REST .json endpoint."""
+    """Fetch all variants of a Shopify product via the public /products/{handle}.js endpoint.
+
+    Unlike the .json endpoint, .js includes per-variant ``available``; its prices are
+    integer cents and the response root is the product itself.
+    """
     parsed = urlparse(url)
     clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    json_url = clean if clean.endswith(".json") else f"{clean}.json"
-    r = _fetch(json_url)
-    product = r.json().get("product", {})
+    for suffix in (".json", ".js"):
+        if clean.endswith(suffix):
+            clean = clean[:-len(suffix)]
+            break
+    product = _fetch(f"{clean}.js").json()
     variants = product.get("variants", [])
     if not variants:
         raise ValueError("No variants found")
     title = product.get("title", "")
     results = []
     for v in variants:
-        available = v.get("available", False)
-        variant_title = v.get("title", "")
-        name = title if not variant_title or variant_title == "Default Title" \
-               else f"{title} – {variant_title}"
+        available = bool(v.get("available", False))
         results.append({
-            "name":         name,
-            "sku":          v.get("sku", ""),
-            "price":        str(v.get("price", "")),
+            "name":         variant_name(title, v.get("title", "")),
+            "sku":          v.get("sku") or "",
+            "price":        format_cents(v.get("price")),
             "in_stock":     available,
             "stock_status": "in_stock" if available else "out_of_stock",
             "source":       "shopify_rest",

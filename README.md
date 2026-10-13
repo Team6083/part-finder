@@ -44,6 +44,16 @@ python main.py --delay 0.5   # 0.5s between requests (default: 1s)
 python main.py --no-delay
 ```
 
+### Verbose mode
+
+```bash
+python main.py -v          # also: python main.py serve -v
+```
+
+Logs to stderr which tool handled each lookup: the matched rule, cache hit/miss,
+and any fallback (e.g. Storefront search → catalog). stdout is unchanged, so
+`--format json` output stays machine-readable.
+
 ### Caching
 
 ```bash
@@ -100,8 +110,8 @@ Content-Type: application/json
   "name": "IP10 Torx Plus Bits (50mm Length, 2-Pack)",
   "sku": "WCP-1838",
   "price": "9.99",
-  "in_stock": false,
-  "stock_status": "out_of_stock",
+  "in_stock": true,
+  "stock_status": "in_stock",
   "source": "shopify_rest",
   "url": "https://wcproducts.com/products/wcp-1838",
   "error": ""

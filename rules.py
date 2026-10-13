@@ -1,10 +1,13 @@
+import logging
 import re
 from cache import ResultCache
 from tools import (
     SearchTool, CachedTool, GenericUrlTool,
-    ShopifyHandleTool, ShopifyCatalogTool,
+    ShopifyHandleTool, ShopifyStorefrontTool, ShopifyCatalogTool,
     JsonLdHandleTool, BigCommerceSearchTool,
 )
+
+log = logging.getLogger(__name__)
 
 
 def sku(pattern: str):
@@ -35,14 +38,19 @@ def build_rules(
     def w(tool, cacheable=True):
         return CachedTool(tool, cache, ttl) if (cache and cacheable) else tool
 
+    def storefront(base):
+        # Storefront search first; the old full-catalog crawl is the last resort.
+        return ShopifyStorefrontTool(base, fallback=ShopifyCatalogTool(base))
+
     return [
-        Rule(w(ShopifyHandleTool("https://wcproducts.com")),
+        Rule(w(ShopifyHandleTool("https://wcproducts.com",
+                                 fallback=ShopifyStorefrontTool("https://wcproducts.com"))),
              sku(r"^wcp-\d+$"),            domain(r"wcproducts\.com")),
-        Rule(w(ShopifyCatalogTool("https://www.andymark.com")),
+        Rule(w(storefront("https://www.andymark.com")),
              sku(r"^am-\d+"),              domain(r"andymark\.com")),
         Rule(w(JsonLdHandleTool("https://www.revrobotics.com")),
              sku(r"^rev-\d+-\d+"),         domain(r"revrobotics\.com")),
-        Rule(w(ShopifyCatalogTool("https://www.thethriftybot.com")),
+        Rule(w(storefront("https://www.thethriftybot.com")),
              sku(r"^ttb-\d+"),             domain(r"thethriftybot\.com")),
         Rule(w(BigCommerceSearchTool("https://www.gobilda.com")),
              sku(r"^\d{4}-\d{4}-\d{4}$"), domain(r"gobilda\.com")),
@@ -58,5 +66,7 @@ def resolve(token: str, rules: list[Rule]):
     for rule in rules:
         if rule.matches(token, is_url):
             tool = rule.tool
+            log.debug("route %s -> %s", token, tool.name)
             return (tool.search_url, token) if is_url else (tool.search, token.upper())
+    log.debug("route %s -> %s (no rule matched)", token, _fallback.name)
     return (_fallback.search_url, token) if is_url else (_fallback.search, token)
