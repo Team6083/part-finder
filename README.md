@@ -100,8 +100,8 @@ Content-Type: application/json
   "name": "IP10 Torx Plus Bits (50mm Length, 2-Pack)",
   "sku": "WCP-1838",
   "price": "9.99",
-  "in_stock": false,
-  "stock_status": "out_of_stock",
+  "in_stock": true,
+  "stock_status": "in_stock",
   "source": "shopify_rest",
   "url": "https://wcproducts.com/products/wcp-1838",
   "error": ""

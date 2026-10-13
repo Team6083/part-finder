@@ -1,9 +1,20 @@
+import logging
+import os
+import time
 import requests
 from abc import ABC, abstractmethod
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from cache import ResultCache
-from parsers import HEADERS, _fetch, parse_shopify_rest, parse_json_ld
+from parsers import (
+    HEADERS, _fetch, parse_shopify_rest, parse_json_ld,
+    format_price, variant_name,
+)
+
+log = logging.getLogger(__name__)
+
+STOREFRONT_API_VERSION = os.environ.get("SHOPIFY_STOREFRONT_API_VERSION", "2026-07")
 
 
 class SearchTool(ABC):
@@ -56,9 +67,12 @@ class GenericUrlTool(SearchTool):
         except Exception as e:
             return None, str(e)
         html = r.text
-        try:
-            if "cdn.shopify.com" in html or "window.Shopify" in html:
+        if "cdn.shopify.com" in html or "window.Shopify" in html:
+            try:
                 return parse_shopify_rest(url), None
+            except Exception:
+                pass  # fall through to JSON-LD
+        try:
             return parse_json_ld(url, html), None
         except Exception as e:
             return None, str(e)
@@ -67,12 +81,14 @@ class GenericUrlTool(SearchTool):
 class ShopifyHandleTool(SearchTool):
     """
     Shopify stores where the product handle == SKU (lowercased).
-    Falls back to /search.json for stores that expose it.
+    Tries /products/{handle}.js first; falls back to ``fallback`` (e.g. a
+    ShopifyStorefrontTool) when the handle lookup misses.
     Example: WCP  →  /products/wcp-1838
     """
 
-    def __init__(self, store_base_url: str):
+    def __init__(self, store_base_url: str, fallback: SearchTool | None = None):
         self.base = store_base_url
+        self._fallback = fallback
 
     def search(self, sku):
         try:
@@ -83,31 +99,132 @@ class ShopifyHandleTool(SearchTool):
         except Exception:
             pass
 
-        try:
-            r = requests.get(
-                f"{self.base}/search.json?q={sku}&type=product",
-                headers=HEADERS, timeout=10,
-            )
-            for hit in (r.json().get("results", []) if r.status_code == 200 else []):
-                path = hit.get("url", "").split("?")[0]
-                if not path:
-                    continue
-                try:
-                    variants = parse_shopify_rest(self.base + path)
-                    match = next((v for v in variants if v["sku"].upper() == sku.upper()), None)
-                    if match:
-                        return match, None
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
+        if self._fallback:
+            return self._fallback.search(sku)
         return None, f"SKU {sku} not found on {self.base}"
 
     def search_url(self, url):
         try:
             return parse_shopify_rest(url), None
         except Exception as e:
+            return None, str(e)
+
+
+class ShopifyStorefrontTool(SearchTool):
+    """
+    Shopify stores queried through the unauthenticated Storefront GraphQL API.
+    SKU lookups use full-text ``search`` and require an exact SKU match on a
+    variant (never the first hit). URL lookups use the product's .js endpoint.
+    Any API failure or miss is delegated to ``fallback`` when provided.
+    Example: AndyMark, ThriftyBot
+    """
+
+    SEARCH_QUERY = """
+    query ($q: String!) {
+      search(first: 5, query: $q, types: PRODUCT) {
+        nodes {
+          ... on Product {
+            handle
+            title
+            variants(first: 100) {
+              pageInfo { hasNextPage endCursor }
+              nodes { sku title availableForSale price { amount } }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    VARIANTS_QUERY = """
+    query ($handle: String!, $after: String) {
+      product(handle: $handle) {
+        variants(first: 100, after: $after) {
+          pageInfo { hasNextPage endCursor }
+          nodes { sku title availableForSale price { amount } }
+        }
+      }
+    }
+    """
+
+    def __init__(self, store_base_url: str, fallback: SearchTool | None = None,
+                 api_version: str = STOREFRONT_API_VERSION):
+        self.base = store_base_url
+        self._fallback = fallback
+        self._endpoint = f"{store_base_url}/api/{api_version}/graphql.json"
+
+    def _graphql(self, query: str, variables: dict) -> dict:
+        r = requests.post(
+            self._endpoint,
+            json={"query": query, "variables": variables},
+            headers={**HEADERS, "Content-Type": "application/json"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        body = r.json()
+        if body.get("errors"):
+            raise ValueError(f"GraphQL errors: {body['errors']}")
+        return body["data"]
+
+    @staticmethod
+    def _find_variant(nodes, sku):
+        return next((v for v in nodes if (v.get("sku") or "").upper() == sku.upper()), None)
+
+    def _to_result(self, product: dict, v: dict) -> dict:
+        available = bool(v.get("availableForSale"))
+        return {
+            "name":         variant_name(product["title"], v.get("title", "")),
+            "sku":          v["sku"],
+            "price":        format_price(v["price"]["amount"]),
+            "in_stock":     available,
+            "stock_status": "in_stock" if available else "out_of_stock",
+            "source":       "shopify_storefront",
+            "url":          f"{self.base}/products/{product['handle']}",
+        }
+
+    def _lookup(self, sku):
+        """Return a result dict or None. Raises on API failure."""
+        data = self._graphql(self.SEARCH_QUERY, {"q": sku})
+        products = [p for p in data["search"]["nodes"] if p]
+        for p in products:
+            variants = p["variants"]
+            match = self._find_variant(variants["nodes"], sku)
+            if match:
+                return self._to_result(p, match)
+        # No match on the first page of any hit: walk further variant pages.
+        for p in products:
+            variants = p["variants"]
+            while variants["pageInfo"]["hasNextPage"]:
+                log.warning("%s has more than 100 variants; paginating", p["handle"])
+                d = self._graphql(self.VARIANTS_QUERY, {
+                    "handle": p["handle"],
+                    "after": variants["pageInfo"]["endCursor"],
+                })
+                variants = d["product"]["variants"]
+                match = self._find_variant(variants["nodes"], sku)
+                if match:
+                    return self._to_result(p, match)
+        return None
+
+    def search(self, sku):
+        try:
+            result = self._lookup(sku)
+            if result:
+                return result, None
+            reason = f"SKU {sku} not found on {self.base}"
+        except Exception as e:
+            log.warning("Storefront search failed for %s: %s", sku, e)
+            reason = str(e)
+        if self._fallback:
+            return self._fallback.search(sku)
+        return None, reason
+
+    def search_url(self, url):
+        try:
+            return parse_shopify_rest(url), None
+        except Exception as e:
+            if self._fallback:
+                return self._fallback.search_url(url)
             return None, str(e)
 
 
@@ -124,19 +241,39 @@ class ShopifyCatalogTool(SearchTool):
         self._catalog: dict | None = None          # sku_upper → result dict
         self._by_handle: dict | None = None        # handle → list[result dict]
 
-    def _build(self):
-        catalog = {}
-        by_handle = {}
-        page = 1
-        while True:
+    PAGE_DELAY = 0.4
+    MAX_ATTEMPTS = 3
+
+    def _fetch_page(self, page):
+        """Fetch one catalog page, retrying 429 / 5xx / non-JSON with exponential backoff."""
+        last_error = None
+        for attempt in range(self.MAX_ATTEMPTS):
+            if attempt:
+                time.sleep(2 ** attempt)
             try:
                 r = requests.get(
                     f"{self.base}/products.json?limit=250&page={page}",
                     headers=HEADERS, timeout=15,
                 )
-                products = r.json().get("products", [])
-            except Exception:
-                break
+                if r.status_code == 429 or r.status_code >= 500:
+                    last_error = f"HTTP {r.status_code}"
+                    continue
+                r.raise_for_status()
+                return r.json().get("products", [])
+            except (requests.RequestException, ValueError) as e:
+                last_error = str(e)
+        raise RuntimeError(
+            f"Catalog page {page} of {self.base} failed after "
+            f"{self.MAX_ATTEMPTS} attempts: {last_error}"
+        )
+
+    def _build(self):
+        """Build the full catalog. Raises on failure so a partial catalog is never stored."""
+        catalog = {}
+        by_handle = {}
+        page = 1
+        while True:
+            products = self._fetch_page(page)
             if not products:
                 break
             for p in products:
@@ -164,6 +301,7 @@ class ShopifyCatalogTool(SearchTool):
                 if handle_results:
                     by_handle[p["handle"]] = handle_results
             page += 1
+            time.sleep(self.PAGE_DELAY)
         self._catalog = catalog
         self._by_handle = by_handle
 
@@ -172,19 +310,25 @@ class ShopifyCatalogTool(SearchTool):
             self._build()
 
     def search(self, sku):
-        self._ensure()
+        try:
+            self._ensure()
+        except Exception as e:
+            return None, str(e)
         result = self._catalog.get(sku.upper())
         if not result:
             return None, f"SKU {sku} not found in catalog of {self.base}"
         return result, None
 
     def search_url(self, url):
-        self._ensure()
         # Extract handle from URL path: /products/{handle}
-        path = url.rstrip("/").rsplit("/", 1)[-1]
-        results = self._by_handle.get(path)
-        if results:
-            return results, None
+        path = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            self._ensure()
+            results = self._by_handle.get(path)
+            if results:
+                return results, None
+        except Exception:
+            pass  # catalog unavailable; fall back to JSON-LD
         # Catalog might not be built yet or handle not found; fall back to JSON-LD
         try:
             r = _fetch(url)
