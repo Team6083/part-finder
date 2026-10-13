@@ -44,6 +44,16 @@ python main.py --delay 0.5   # 0.5s between requests (default: 1s)
 python main.py --no-delay
 ```
 
+### Verbose mode
+
+```bash
+python main.py -v          # also: python main.py serve -v
+```
+
+Logs to stderr which tool handled each lookup: the matched rule, cache hit/miss,
+and any fallback (e.g. Storefront search → catalog). stdout is unchanged, so
+`--format json` output stays machine-readable.
+
 ### Caching
 
 ```bash

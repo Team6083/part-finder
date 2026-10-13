@@ -18,6 +18,12 @@ STOREFRONT_API_VERSION = os.environ.get("SHOPIFY_STOREFRONT_API_VERSION", "2026-
 
 
 class SearchTool(ABC):
+    @property
+    def name(self) -> str:
+        base = getattr(self, "base", "")
+        host = urlparse(base).netloc if base else ""
+        return f"{type(self).__name__}({host})" if host else type(self).__name__
+
     @abstractmethod
     def search(self, query: str) -> tuple:
         """Search by SKU. Return (result_dict | None, error_str | None)."""
@@ -39,10 +45,16 @@ class CachedTool(SearchTool):
         self._cache = cache
         self._ttl = ttl
 
+    @property
+    def name(self) -> str:
+        return f"Cached[{self._tool.name}]"
+
     def _cached(self, key, fn):
         hit = self._cache.get(key, self._ttl)
         if hit is not None:
+            log.debug("%s: cache hit for %s", self.name, key)
             return hit, None
+        log.debug("%s: cache miss for %s", self.name, key)
         result, error = fn()
         if result:
             self._cache.set(key, result)
@@ -69,11 +81,15 @@ class GenericUrlTool(SearchTool):
         html = r.text
         if "cdn.shopify.com" in html or "window.Shopify" in html:
             try:
-                return parse_shopify_rest(url), None
-            except Exception:
-                pass  # fall through to JSON-LD
+                results = parse_shopify_rest(url)
+                log.debug("%s: Shopify .js hit for %s", self.name, url)
+                return results, None
+            except Exception as e:
+                log.debug("%s: Shopify .js failed for %s (%s); trying JSON-LD", self.name, url, e)
         try:
-            return parse_json_ld(url, html), None
+            results = parse_json_ld(url, html)
+            log.debug("%s: JSON-LD hit for %s", self.name, url)
+            return results, None
         except Exception as e:
             return None, str(e)
 
@@ -95,17 +111,22 @@ class ShopifyHandleTool(SearchTool):
             variants = parse_shopify_rest(f"{self.base}/products/{sku.lower()}")
             match = next((v for v in variants if v["sku"].upper() == sku.upper()), None)
             if match:
+                log.debug("%s: .js handle hit for %s", self.name, sku)
                 return match, None
-        except Exception:
-            pass
+            log.debug("%s: .js handle has no exact SKU match for %s", self.name, sku)
+        except Exception as e:
+            log.debug("%s: .js handle lookup failed for %s (%s)", self.name, sku, e)
 
         if self._fallback:
+            log.debug("%s: falling back to %s", self.name, self._fallback.name)
             return self._fallback.search(sku)
         return None, f"SKU {sku} not found on {self.base}"
 
     def search_url(self, url):
         try:
-            return parse_shopify_rest(url), None
+            results = parse_shopify_rest(url)
+            log.debug("%s: .js hit for %s", self.name, url)
+            return results, None
         except Exception as e:
             return None, str(e)
 
@@ -210,20 +231,27 @@ class ShopifyStorefrontTool(SearchTool):
         try:
             result = self._lookup(sku)
             if result:
+                log.debug("%s: Storefront search hit for %s", self.name, sku)
                 return result, None
             reason = f"SKU {sku} not found on {self.base}"
+            log.debug("%s: Storefront search has no exact SKU match for %s", self.name, sku)
         except Exception as e:
             log.warning("Storefront search failed for %s: %s", sku, e)
             reason = str(e)
         if self._fallback:
+            log.debug("%s: falling back to %s", self.name, self._fallback.name)
             return self._fallback.search(sku)
         return None, reason
 
     def search_url(self, url):
         try:
-            return parse_shopify_rest(url), None
+            results = parse_shopify_rest(url)
+            log.debug("%s: .js hit for %s", self.name, url)
+            return results, None
         except Exception as e:
+            log.debug("%s: .js failed for %s (%s)", self.name, url, e)
             if self._fallback:
+                log.debug("%s: falling back to %s", self.name, self._fallback.name)
                 return self._fallback.search_url(url)
             return None, str(e)
 
@@ -304,6 +332,7 @@ class ShopifyCatalogTool(SearchTool):
             time.sleep(self.PAGE_DELAY)
         self._catalog = catalog
         self._by_handle = by_handle
+        log.debug("%s: built catalog with %d SKUs", self.name, len(catalog))
 
     def _ensure(self):
         if self._catalog is None:
@@ -317,6 +346,7 @@ class ShopifyCatalogTool(SearchTool):
         result = self._catalog.get(sku.upper())
         if not result:
             return None, f"SKU {sku} not found in catalog of {self.base}"
+        log.debug("%s: catalog hit for %s", self.name, sku)
         return result, None
 
     def search_url(self, url):
@@ -326,13 +356,16 @@ class ShopifyCatalogTool(SearchTool):
             self._ensure()
             results = self._by_handle.get(path)
             if results:
+                log.debug("%s: catalog hit for %s", self.name, path)
                 return results, None
-        except Exception:
-            pass  # catalog unavailable; fall back to JSON-LD
+        except Exception as e:
+            log.debug("%s: catalog unavailable (%s); trying JSON-LD", self.name, e)
         # Catalog might not be built yet or handle not found; fall back to JSON-LD
         try:
             r = _fetch(url)
-            return parse_json_ld(url, r.text), None
+            results = parse_json_ld(url, r.text)
+            log.debug("%s: JSON-LD hit for %s", self.name, url)
+            return results, None
         except Exception as e:
             return None, str(e)
 
@@ -354,6 +387,7 @@ class JsonLdHandleTool(SearchTool):
             r = _fetch(url)
             results = parse_json_ld(url, r.text)
             match = next((v for v in results if v["sku"].upper() == sku.upper()), results[0])
+            log.debug("%s: JSON-LD hit for %s at %s", self.name, sku, url)
             return match, None
         except Exception as e:
             return None, str(e)
@@ -380,12 +414,14 @@ class BigCommerceSearchTool(SearchTool):
             return None, f"SKU {sku} not found on {self.base}"
 
         product_url = card["href"].split("?")[0]
+        log.debug("%s: search page first hit %s", self.name, product_url)
         try:
             r2 = _fetch(product_url)
             results = parse_json_ld(product_url, r2.text)
             match = next((v for v in results if v["sku"].upper() == sku.upper()), None)
             if not match:
                 return None, f"SKU mismatch: {sku} not found in search results"
+            log.debug("%s: JSON-LD hit for %s", self.name, sku)
             return match, None
         except Exception as e:
             return None, str(e)

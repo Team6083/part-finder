@@ -1,3 +1,4 @@
+import logging
 import re
 from cache import ResultCache
 from tools import (
@@ -5,6 +6,8 @@ from tools import (
     ShopifyHandleTool, ShopifyStorefrontTool, ShopifyCatalogTool,
     JsonLdHandleTool, BigCommerceSearchTool,
 )
+
+log = logging.getLogger(__name__)
 
 
 def sku(pattern: str):
@@ -63,5 +66,7 @@ def resolve(token: str, rules: list[Rule]):
     for rule in rules:
         if rule.matches(token, is_url):
             tool = rule.tool
+            log.debug("route %s -> %s", token, tool.name)
             return (tool.search_url, token) if is_url else (tool.search, token.upper())
+    log.debug("route %s -> %s (no rule matched)", token, _fallback.name)
     return (_fallback.search_url, token) if is_url else (_fallback.search, token)
