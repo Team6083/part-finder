@@ -37,6 +37,7 @@ SKUS = {
     "REV-11-2159":    ("REV",       True),
     "REV-21-1652":    ("REV",       True),
     "REV-21-2108":    ("REV",       True),   # variant SKU: product page URL isn't derivable, resolved via option API
+    "REV-21-2809":    ("REV",       True),   # option label has the SKU first: "(REV-21-2809) ..."
     "5000-0002-0001": ("goBILDA",   True),
     "1310-0016-4008": ("goBILDA",   True),
 }

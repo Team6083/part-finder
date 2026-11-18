@@ -249,6 +249,66 @@ class BigCommerceVariantTest(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["data"]["attribute[422]"], "1916")
 
 
+class BigCommerceVariantEdgeTest(unittest.TestCase):
+    URL = "https://r.com/c/"
+
+    @staticmethod
+    def _page(*labels):
+        radios = "".join(f'<label data-product-attribute-value="{i}" for="attribute_radio_9_{i}">{l}</label>'
+                         for i, l in enumerate(labels, 1))
+        return ('<h1>Shafts</h1><input name="product_id" value="675">' + radios +
+                '<script type="application/ld+json">{"@type":"Product","name":"Shafts","sku":675,'
+                '"offers":{"price":"5","url":"u"}}</script>')
+
+    @staticmethod
+    def _api(sku, price=5):
+        return _resp(200, {"data": {"sku": sku, "instock": True, "price": {"without_tax": {"value": price}}}})
+
+    def _tool(self):
+        return BigCommerceSearchTool("https://r.com")
+
+    @mock.patch("tools.requests.post")
+    def test_sku_first_label(self, post):
+        post.return_value = self._api("REV-21-2809")
+        page = self._page("(REV-21-2809) 1/2in Rounded Hex Shaft - 1.0in")
+        self.assertEqual(self._tool()._variants(self.URL, page, "REV-21-2809")[0]["sku"], "REV-21-2809")
+
+    @mock.patch("tools.requests.post")
+    def test_multipack_label_matches_base_sku_only_without_exact(self, post):
+        post.side_effect = [self._api("REV-21-2003-PK10"), self._api("REV-21-2003-PK50")]
+        page = self._page("(REV-21-2003-PK10) Spacer - 10 Pack", "(REV-21-2003-PK50) Spacer - 50 Pack")
+        v = self._tool()._variants(self.URL, page, "REV-21-2003")
+        self.assertEqual(len(v), 2)
+        self.assertEqual(post.call_count, 2)
+
+    @mock.patch("tools.requests.post")
+    def test_empty_api_answers_are_not_variants(self, post):
+        page = self._page("Kit (REV-21-2108)")
+        for body in ({"data": {"sku": None, "instock": True, "price": {"without_tax": {"value": 8}}}},
+                     {"data": []},
+                     {"data": {"sku": "OTHER-1", "instock": True}}):
+            post.return_value = _resp(200, body)
+            self.assertEqual(self._tool()._variants(self.URL, page, "REV-21-2108"), [])
+
+    @mock.patch("tools.requests.post")
+    def test_labels_without_sku_are_not_queried(self, post):
+        self._tool()._variants(self.URL, self._page("Plain option"))
+        post.assert_not_called()
+
+    @mock.patch("tools.requests.post", side_effect=requests.Timeout("slow"))
+    @mock.patch("tools._fetch")
+    def test_search_url_falls_back_to_json_ld_when_post_fails(self, fetch, post):
+        fetch.return_value = mock.Mock(text=self._page("Kit (REV-21-2108)"))
+        r, e = self._tool().search_url(self.URL)
+        self.assertIsNone(e)
+        self.assertEqual(r[0]["sku"], 675)
+
+    @mock.patch("tools.requests.post", side_effect=requests.Timeout("slow"))
+    def test_post_failure_propagates_for_sku_lookup(self, post):
+        with self.assertRaises(requests.Timeout):
+            self._tool()._variants(self.URL, self._page("Kit (REV-21-2108)"), "REV-21-2108")
+
+
 class MappedLookupFailureTest(unittest.TestCase):
     """Only a gone product drops a mapping; transient errors and cache faults must not."""
 

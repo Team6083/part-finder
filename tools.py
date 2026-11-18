@@ -494,7 +494,7 @@ class BigCommerceSearchTool(SearchTool):
     """
 
     MAX_SEARCH_CANDIDATES = 3
-    MAX_VARIANTS = 12
+    MAX_VARIANTS = 24
 
     def __init__(self, store_base_url: str, url_map: UrlMap | None = None):
         self.base = store_base_url
@@ -521,7 +521,8 @@ class BigCommerceSearchTool(SearchTool):
 
     @staticmethod
     def _label_sku(label):
-        m = re.search(r"\(([A-Za-z0-9][\w-]*)\)\s*$", label)
+        """SKU in parentheses anywhere in an option label: "Kit (REV-21-2108)" or "(REV-21-2809) Shaft"."""
+        m = re.search(r"\(([A-Za-z]{2,}-[\w-]+)\)", label)
         return m[1] if m else None
 
     def _variant(self, url, pid, name, attr, value, label):
@@ -531,12 +532,17 @@ class BigCommerceSearchTool(SearchTool):
                           data={"action": "add", "product_id": pid, "qty[]": 1,
                                 f"attribute[{attr}]": value})
         r.raise_for_status()
-        data = r.json().get("data") or {}
+        data = r.json().get("data")
+        # An unknown or partial selection comes back 200 with sku None (or data []): not a variant.
+        label_sku = self._label_sku(label)
+        if not isinstance(data, dict) or not data.get("sku") or \
+                (label_sku and data["sku"].upper() != label_sku.upper()):
+            return None
         price = ((data.get("price") or {}).get("without_tax") or {}).get("value", "")
         in_stock = bool(data.get("instock")) and data.get("purchasable", True) is not False
         return {
             "name":         f"{name} - {label}" if name else label,
-            "sku":          data.get("sku") or self._label_sku(label) or "",
+            "sku":          data["sku"],
             "price":        format_price(price) if price != "" else "",
             "in_stock":     in_stock,
             "stock_status": "in_stock" if in_stock else "out_of_stock",
@@ -545,17 +551,37 @@ class BigCommerceSearchTool(SearchTool):
         }
 
     def _variants(self, url, html, sku=None):
-        """Variants of an option-based product page; only the one matching sku if given."""
+        """Variants of an option-based product page; only the one matching sku if given.
+
+        Only options whose label carries a SKU are queried. With a sku, errors propagate so
+        the caller can tell a transient failure from a missing SKU; when listing a page, a
+        failing option is skipped.
+        """
         pid, name, options = self._options(html)
-        if not pid:
+        if not pid or not pid.isdigit():
             return []
+        labelled = [(a, v, l, self._label_sku(l)) for a, v, l in options]
+        labelled = [o for o in labelled if o[3]]
+        if sku:
+            want = sku.upper()
+            exact = [o for o in labelled if o[3].upper() == want]
+            # Multi-packs are listed as REV-21-2003-PK10; fall back to them only when no exact match.
+            labelled = exact or [o for o in labelled if o[3].upper().startswith(want + "-PK")]
+        if len(labelled) > self.MAX_VARIANTS:
+            log.warning("%s: %s lists %d variants; showing the first %d",
+                        self.name, url, len(labelled), self.MAX_VARIANTS)
+            labelled = labelled[:self.MAX_VARIANTS]
         out = []
-        for attr, value, label in options:
-            if sku and (self._label_sku(label) or "").upper() != sku.upper():
+        for attr, value, label, _ in labelled:
+            try:
+                variant = self._variant(url, pid, name, attr, value, label)
+            except Exception as e:
+                if sku:
+                    raise
+                log.debug("%s: skipping option %s on %s (%s)", self.name, label, url, e)
                 continue
-            if len(out) >= self.MAX_VARIANTS:
-                break
-            out.append(self._variant(url, pid, name, attr, value, label))
+            if variant:
+                out.append(variant)
         return out
 
     def _product(self, product_url, sku):
