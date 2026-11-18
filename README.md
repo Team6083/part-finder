@@ -57,17 +57,43 @@ and any fallback (e.g. Storefront search → catalog). stdout is unchanged, so
 ### Caching
 
 ```bash
-# Cache results with default 24h TTL
+# Cache to a file: results for 10 minutes, SKU -> product URL for 7 days
 python main.py --cache-file cache.json
 
-# Custom TTL (hours), 0 = never expire
-python main.py --cache-file cache.json --cache-ttl 1
+# Custom TTLs (hours), 0 = never expire
+python main.py --cache-file cache.json --cache-ttl 1 --map-ttl 24
 python main.py --cache-file cache.json --cache-ttl 0
 ```
 
-For AndyMark and ThriftyBot, the first query fetches the full product catalog to
-build a SKU→handle mapping. All subsequent queries in the same session read
-directly from memory.
+There are two cache layers over the same backend:
+
+| Layer | Holds | Default TTL | Flag |
+|---|---|---|---|
+| Result cache | full lookup result (price, stock) | 10 minutes | `--cache-ttl` |
+| URL map | SKU → product page URL (AndyMark, ThriftyBot, goBILDA, and the WCP fallback) | 7 days | `--map-ttl` |
+
+When the result cache expires, a URL map hit goes straight to the product page and
+skips the search. If that page 404s or no longer has the SKU, the entry is dropped
+and the search runs again. `serve` caches in memory by default (per process, never evicted);
+pass `--no-cache` to turn caching off. A `--cache-file` is safe for one process at a time:
+two processes sharing a file can overwrite each other's entries.
+
+For AndyMark and ThriftyBot, lookups use Storefront API search. Only when that finds
+no exact SKU match does the first query fall back to fetching the full product
+catalog (kept in memory for the rest of the session).
+
+### Checking the cache against live stores
+
+`scripts/cache_smoke.py` starts `serve -v`, queries each SKU three times (cold, immediately
+again, after the result TTL expires) and reports from the server log which path served each one:
+a fresh fetch, a result-cache hit, or a URL-map hit. It calls the real store sites, so it is a manual
+check and is not run by CI or included in the Docker image.
+
+```bash
+python scripts/cache_smoke.py                  # default SKUs across all stores
+python scripts/cache_smoke.py WCP-1810 am-3645 # only these
+python scripts/cache_smoke.py --slow           # also an AndyMark SKU that forces the catalog crawl
+```
 
 ---
 
@@ -125,9 +151,9 @@ Content-Type: application/json
 | SKU format | Store | Method |
 |---|---|---|
 | `WCP-XXXX` | [West Coast Products](https://wcproducts.com) | Shopify REST (SKU = handle) |
-| `am-XXXX` / `am-XXXX_VAR` | [AndyMark](https://www.andymark.com) | Shopify catalog (paginated) |
+| `am-XXXX` / `am-XXXX_VAR` | [AndyMark](https://www.andymark.com) | Shopify Storefront search, catalog fallback |
 | `REV-XX-XXXX` | [REV Robotics](https://www.revrobotics.com) | JSON-LD (SKU = URL handle) |
-| `TTB-XXXX` | [ThriftyBot](https://www.thethriftybot.com) | Shopify catalog (paginated) |
+| `TTB-XXXX` | [ThriftyBot](https://www.thethriftybot.com) | Shopify Storefront search, catalog fallback |
 | `XXXX-XXXX-XXXX` | [goBILDA](https://www.gobilda.com) | BigCommerce search + JSON-LD |
 
 Direct URLs from any supported store are also accepted.
@@ -154,7 +180,8 @@ Rule(w(BigCommerceSearchTool("https://example.com")),
 ```
 
 A `Rule` accepts any number of `sku(pattern)` and `domain(pattern)` conditions.
-When `--cache-file` is set, all rules are automatically wrapped with `CachedTool`.
+When a cache is active (`--cache-file`, or always for `serve` unless `--no-cache`), all rules are
+automatically wrapped with `CachedTool`.
 
 ---
 

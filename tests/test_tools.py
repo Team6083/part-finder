@@ -3,8 +3,18 @@ from unittest import mock
 
 import requests
 
+import argparse
+import os
+import stat
+import tempfile
+
+import main
+from cache import MemoryCache, FileCache, UrlMap
+from rules import build_rules
 from parsers import format_cents, parse_shopify_rest
-from tools import ShopifyCatalogTool, ShopifyStorefrontTool
+from tools import (
+    CachedTool, ShopifyCatalogTool, ShopifyStorefrontTool, BigCommerceSearchTool,
+)
 
 
 def _resp(status=200, payload=None, json_error=False):
@@ -79,12 +89,19 @@ class CatalogRetryTest(unittest.TestCase):
         self.assertEqual(result["sku"], "A-1")
 
 
+def _node(handle, skus, has_next=False):
+    return {"handle": handle, "title": handle, "variants": {
+        "pageInfo": {"hasNextPage": has_next, "endCursor": "c"},
+        "nodes": [{"sku": s, "title": "Default Title", "availableForSale": True,
+                   "price": {"amount": "167.0"}} for s in skus]}}
+
+
+def _http_error(status):
+    return requests.HTTPError(f"HTTP {status}", response=mock.Mock(status_code=status))
+
+
 class StorefrontTest(unittest.TestCase):
-    def _node(self, handle, skus, has_next=False):
-        return {"handle": handle, "title": handle, "variants": {
-            "pageInfo": {"hasNextPage": has_next, "endCursor": "c"},
-            "nodes": [{"sku": s, "title": "Default Title", "availableForSale": True,
-                       "price": {"amount": "167.0"}} for s in skus]}}
+    _node = staticmethod(_node)
 
     @mock.patch("tools.requests.post")
     def test_requires_exact_sku_match(self, post):
@@ -119,6 +136,326 @@ class StorefrontTest(unittest.TestCase):
         ]
         r, e = ShopifyStorefrontTool("https://s.com").search("AM-2")
         self.assertEqual(r["sku"], "AM-2")
+
+
+class UrlMapTest(unittest.TestCase):
+    def test_roundtrip_delete_and_ttl(self):
+        m = UrlMap(MemoryCache(), ttl=100)
+        m.set("s", "am-1", "https://s.com/products/a")
+        self.assertEqual(m.get("s", "AM-1"), "https://s.com/products/a")
+        m.delete("s", "am-1")
+        self.assertIsNone(m.get("s", "am-1"))
+        m.set("s", "am-1", "https://s.com/products/a")
+        with mock.patch("cache.time.time", return_value=10**10):
+            self.assertIsNone(m.get("s", "am-1"))
+
+    def test_file_cache_delete(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            c = FileCache(os.path.join(d, "c.json"))
+            c.delete("missing")
+            c.set("k", {"url": "u"})
+            c.delete("k")
+            self.assertIsNone(c.get("k", None))
+
+
+class StorefrontUrlMapTest(unittest.TestCase):
+    """Checks the SKU -> URL cache layer."""
+    _node = staticmethod(_node)
+
+    def setUp(self):
+        self.map = UrlMap(MemoryCache(), ttl=None)
+        self.tool = ShopifyStorefrontTool("https://s.com", url_map=self.map)
+
+    def _js(self, sku):
+        return mock.Mock(json=mock.Mock(return_value={
+            "title": "T", "variants": [{"sku": sku, "title": "Default Title",
+                                        "price": 100, "available": True}]}))
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_second_lookup_skips_search(self, post, fetch):
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [self._node("h", ["AM-2"])]}}})
+        fetch.return_value = self._js("AM-2")
+        self.tool.search("AM-2")
+        self.assertEqual(self.map.get("https://s.com", "AM-2"), "https://s.com/products/h")
+        r, e = self.tool.search("AM-2")
+        self.assertEqual(post.call_count, 1)
+        fetch.assert_called_once_with("https://s.com/products/h.js")
+        self.assertEqual(r["sku"], "AM-2")
+        self.assertEqual(r["price"], "1.00")
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_stale_mapping_is_dropped_and_researched(self, post, fetch):
+        self.map.set("https://s.com", "AM-2", "https://s.com/products/gone")
+        fetch.side_effect = _http_error(404)
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [self._node("new", ["AM-2"])]}}})
+        r, e = self.tool.search("AM-2")
+        self.assertEqual(r["url"], "https://s.com/products/new")
+        self.assertEqual(self.map.get("https://s.com", "AM-2"), "https://s.com/products/new")
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_mapping_with_sku_mismatch_is_dropped(self, post, fetch):
+        self.map.set("https://s.com", "AM-2", "https://s.com/products/old")
+        fetch.return_value = self._js("OTHER")
+        post.return_value = _resp(200, {"data": {"search": {"nodes": []}}})
+        r, e = self.tool.search("AM-2")
+        self.assertIsNone(r)
+        self.assertIsNone(self.map.get("https://s.com", "AM-2"))
+
+
+class BigCommerceUrlMapTest(unittest.TestCase):
+    LD = ('<script type="application/ld+json">{"@type":"Product","name":"N",'
+          '"offers":[{"sku":"1000-0001-0001","price":"1","url":"u"}]}</script>')
+    SEARCH = '<li class="product"><a class="card" href="https://g.com/p/?x=1">p</a></li>'
+
+    @mock.patch("tools._fetch")
+    def test_mapped_lookup_skips_search_page(self, fetch):
+        m = UrlMap(MemoryCache(), ttl=None)
+        tool = BigCommerceSearchTool("https://g.com", url_map=m)
+        fetch.side_effect = [mock.Mock(text=self.SEARCH), mock.Mock(text=self.LD)]
+        tool.search("1000-0001-0001")
+        self.assertEqual(m.get("https://g.com", "1000-0001-0001"), "https://g.com/p/")
+        fetch.reset_mock()
+        fetch.side_effect = [mock.Mock(text=self.LD)]
+        r, e = tool.search("1000-0001-0001")
+        fetch.assert_called_once_with("https://g.com/p/")
+        self.assertEqual(r["sku"], "1000-0001-0001")
+
+
+class MappedLookupFailureTest(unittest.TestCase):
+    """Only a gone product drops a mapping; transient errors and cache faults must not."""
+
+    URL = "https://s.com/products/h"
+
+    def setUp(self):
+        self.map = UrlMap(MemoryCache(), ttl=None)
+        self.map.set("https://s.com", "AM-2", self.URL)
+        self.tool = ShopifyStorefrontTool("https://s.com", url_map=self.map)
+
+    def _search_hit(self, post):
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [_node("h", ["AM-2"])]}}})
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_transient_errors_keep_mapping(self, post, fetch):
+        # Search finds nothing, so a surviving entry proves it was never deleted
+        # (a successful search would re-store it and hide the bug).
+        post.return_value = _resp(200, {"data": {"search": {"nodes": []}}})
+        for err in (requests.Timeout("slow"), _http_error(429), _http_error(503)):
+            fetch.side_effect = err
+            self.tool.search("AM-2")
+            self.assertEqual(self.map.get("https://s.com", "AM-2"), self.URL)
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_410_drops_mapping(self, post, fetch):
+        post.return_value = _resp(200, {"data": {"search": {"nodes": []}}})
+        fetch.side_effect = _http_error(410)
+        self.tool.search("AM-2")
+        self.assertIsNone(self.map.get("https://s.com", "AM-2"))
+
+    @mock.patch("tools._fetch")
+    def test_goBILDA_timeout_keeps_mapping(self, fetch):
+        m = UrlMap(MemoryCache(), ttl=None)
+        m.set("https://g.com", "1000-0001-0001", "https://g.com/p/")
+        fetch.side_effect = requests.Timeout("slow")
+        BigCommerceSearchTool("https://g.com", url_map=m).search("1000-0001-0001")
+        self.assertEqual(m.get("https://g.com", "1000-0001-0001"), "https://g.com/p/")
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_broken_cache_does_not_break_lookup(self, post, fetch):
+        class Broken(MemoryCache):
+            def get(self, *a, **k):
+                raise OSError("disk")
+            set = delete = get
+        tool = ShopifyStorefrontTool("https://s.com", url_map=UrlMap(Broken(), ttl=None))
+        self._search_hit(post)
+        r, e = tool.search("AM-2")
+        self.assertIsNone(e)
+        self.assertEqual(r["sku"], "AM-2")
+
+    def test_cached_tool_survives_broken_cache(self):
+        class Broken(MemoryCache):
+            def get(self, *a, **k):
+                raise OSError("disk")
+            set = get
+        inner = mock.Mock()
+        inner.name = "inner"
+        inner.search.return_value = ({"sku": "A"}, None)
+        r, e = CachedTool(inner, Broken(), ttl=60).search("A")
+        self.assertEqual(r, {"sku": "A"})
+
+
+class FileCacheRobustnessTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile, os
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "c.json")
+
+    def test_corrupt_file_is_an_empty_cache(self):
+        with open(self.path, "w") as f:
+            f.write('{"a": {"result"')
+        c = FileCache(self.path)
+        self.assertIsNone(c.get("a", None))
+        c.set("b", {"x": 1})
+        self.assertEqual(c.get("b", None), {"x": 1})
+
+    def test_concurrent_writes_lose_nothing(self):
+        import threading
+        c = FileCache(self.path)
+        threads = [threading.Thread(target=c.set, args=(f"k{i}", {"i": i})) for i in range(40)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual([c.get(f"k{i}", None) for i in range(40)],
+                         [{"i": i} for i in range(40)])
+
+    def test_no_temp_files_left_behind(self):
+        import os
+        c = FileCache(self.path)
+        c.set("a", {"x": 1})
+        c.delete("a")
+        self.assertEqual(os.listdir(self.dir.name), ["c.json"])
+
+
+class FileCachePermissionTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "c.json")
+
+    def test_unreadable_file_is_not_wiped(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file permissions")
+        c = FileCache(self.path)
+        c.set("a", {"x": 1})
+        os.chmod(self.path, 0)
+        self.addCleanup(os.chmod, self.path, 0o644)
+        with self.assertRaises(OSError):
+            c.set("b", {"x": 2})
+        os.chmod(self.path, 0o644)
+        self.assertEqual(c.get("a", None), {"x": 1})
+
+    def test_mode_is_preserved(self):
+        c = FileCache(self.path)
+        c.set("a", {"x": 1})
+        os.chmod(self.path, 0o640)
+        c.set("b", {"x": 2})
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o640)
+
+    def test_new_file_is_world_readable(self):
+        FileCache(self.path).set("a", {"x": 1})
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o644)
+
+
+class StaleOnEmptyPageTest(unittest.TestCase):
+    @mock.patch("tools._fetch")
+    def test_goBILDA_200_without_json_ld_drops_mapping(self, fetch):
+        m = UrlMap(MemoryCache(), ttl=None)
+        m.set("https://g.com", "1000-0001-0001", "https://g.com/gone/")
+        fetch.side_effect = [mock.Mock(text="<html>moved</html>"), mock.Mock(text="")]
+        BigCommerceSearchTool("https://g.com", url_map=m).search("1000-0001-0001")
+        self.assertIsNone(m.get("https://g.com", "1000-0001-0001"))
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_shopify_non_json_page_keeps_mapping(self, post, fetch):
+        m = UrlMap(MemoryCache(), ttl=None)
+        m.set("https://s.com", "AM-2", "https://s.com/products/h")
+        fetch.return_value.json.side_effect = requests.exceptions.JSONDecodeError("x", "", 0)
+        post.return_value = _resp(200, {"data": {"search": {"nodes": []}}})
+        ShopifyStorefrontTool("https://s.com", url_map=m).search("AM-2")
+        self.assertIsNotNone(m.get("https://s.com", "AM-2"))
+
+
+class MappedResultConsistencyTest(unittest.TestCase):
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_mapped_result_equals_searched_result(self, post, fetch):
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [{
+            "handle": "h", "title": "T", "variants": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"sku": "AM-2", "title": "Default Title",
+                           "availableForSale": True, "price": {"amount": "167.0"}}]}}]}}})
+        fetch.return_value.json.return_value = {"title": "T", "variants": [
+            {"sku": "AM-2", "title": "Default Title", "price": 16700, "available": True}]}
+        tool = ShopifyStorefrontTool("https://s.com", url_map=UrlMap(MemoryCache(), ttl=None))
+        searched, _ = tool.search("AM-2")
+        mapped, _ = tool.search("AM-2")
+        self.assertEqual(fetch.call_count, 1)  # second call really used the map
+        self.assertEqual(mapped, searched)
+
+
+class WcpFallbackMapTest(unittest.TestCase):
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_wcp_fallback_is_mapped(self, post, fetch):
+        cache = MemoryCache()
+        rules = build_rules(cache, ttl=None, map_ttl=None)
+        wcp = next(r.tool for r in rules if r.matches("WCP-9999", False))._tool
+        fetch.side_effect = [requests.HTTPError("HTTP 404", response=mock.Mock(status_code=404))]
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [_node("odd-handle", ["WCP-9999"])]}}})
+        r, e = wcp.search("WCP-9999")
+        self.assertEqual(r["url"], "https://wcproducts.com/products/odd-handle")
+        self.assertEqual(UrlMap(cache).get("https://wcproducts.com", "WCP-9999"),
+                         "https://wcproducts.com/products/odd-handle")
+
+
+class CacheFlagsTest(unittest.TestCase):
+    def _args(self, **kw):
+        ns = dict(cache_file=None, no_cache=False,
+                  cache_ttl=main.DEFAULT_CACHE_TTL_HOURS, map_ttl=main.DEFAULT_MAP_TTL_HOURS)
+        ns.update(kw)
+        return argparse.Namespace(**ns)
+
+    def test_defaults(self):
+        cache, ttl, map_ttl = main._make_cache(self._args())
+        self.assertIsNone(cache)
+        self.assertEqual(ttl, 600)
+        self.assertEqual(map_ttl, 7 * 86400)
+
+    def test_serve_defaults_to_memory_cache(self):
+        cache, _, _ = main._make_cache(self._args(), default_memory=True)
+        self.assertIsInstance(cache, MemoryCache)
+
+    def test_no_cache_wins_over_serve_default(self):
+        cache, _, _ = main._make_cache(self._args(no_cache=True), default_memory=True)
+        self.assertIsNone(cache)
+
+    def test_zero_ttl_means_never_expire(self):
+        _, ttl, map_ttl = main._make_cache(self._args(cache_ttl=0, map_ttl=0))
+        self.assertIsNone(ttl)
+        self.assertIsNone(map_ttl)
+
+    def test_no_cache_and_cache_file_conflict(self):
+        parser = argparse.ArgumentParser()
+        main._add_cache_args(parser)
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            parser.parse_args(["--no-cache", "--cache-file", "x.json"])
+
+
+class TwoLayerCacheTest(unittest.TestCase):
+    def test_result_expires_while_mapping_survives(self):
+        cache = MemoryCache()
+        m = UrlMap(cache, ttl=7 * 86400)
+        m.set("s", "A", "https://s.com/products/a")
+        inner = mock.Mock()
+        inner.name = "inner"
+        inner.search.return_value = ({"sku": "A"}, None)
+        tool = CachedTool(inner, cache, ttl=600)
+        tool.search("A")
+        tool.search("A")
+        self.assertEqual(inner.search.call_count, 1)
+        with mock.patch("cache.time.time", return_value=__import__("time").time() + 3600):
+            tool.search("A")
+            self.assertEqual(inner.search.call_count, 2)
+            self.assertEqual(m.get("s", "A"), "https://s.com/products/a")
 
 
 if __name__ == "__main__":

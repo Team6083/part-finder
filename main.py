@@ -6,19 +6,32 @@ import time
 import argparse
 import logging
 
-from cache import FileCache
+from cache import FileCache, MemoryCache
 from rules import build_rules, resolve
 from formatters import TSV_HEADER, format_tsv, format_human
 
 
+DEFAULT_CACHE_TTL_HOURS = 10 / 60
+DEFAULT_MAP_TTL_HOURS = 24 * 7
+
+
 def _add_cache_args(parser):
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--cache-file", metavar="PATH",
-        help="Persist result cache to a JSON file",
+        help="Persist result cache to a JSON file (one process at a time per file)",
+    )
+    group.add_argument(
+        "--no-cache", action="store_true",
+        help="Disable all caching (serve otherwise caches in memory)",
     )
     parser.add_argument(
-        "--cache-ttl", type=float, default=24.0, metavar="HOURS",
-        help="Cache expiry in hours (default: 24, 0 = never expire)",
+        "--cache-ttl", type=float, default=DEFAULT_CACHE_TTL_HOURS, metavar="HOURS",
+        help="Result (price/stock) cache expiry in hours (default: 10 minutes, 0 = never expire)",
+    )
+    parser.add_argument(
+        "--map-ttl", type=float, default=DEFAULT_MAP_TTL_HOURS, metavar="HOURS",
+        help="SKU -> product URL cache expiry in hours (default: 168 = 7 days, 0 = never expire)",
     )
 
 
@@ -35,16 +48,22 @@ def _setup_logging(verbose):
         logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
-def _make_cache(args):
+def _make_cache(args, default_memory=False):
     ttl = None if args.cache_ttl == 0 else args.cache_ttl * 3600
-    cache = FileCache(args.cache_file) if args.cache_file else None
-    return cache, ttl
+    map_ttl = None if args.map_ttl == 0 else args.map_ttl * 3600
+    if args.no_cache:
+        cache = None
+    elif args.cache_file:
+        cache = FileCache(args.cache_file)
+    else:
+        cache = MemoryCache() if default_memory else None
+    return cache, ttl, map_ttl
 
 
 def run_cli(args):
     _setup_logging(args.verbose)
-    cache, ttl = _make_cache(args)
-    rules = build_rules(cache, ttl)
+    cache, ttl, map_ttl = _make_cache(args)
+    rules = build_rules(cache, ttl, map_ttl)
     delay = 0.0 if args.no_delay else args.delay
     first = True
 
@@ -101,8 +120,9 @@ def run_serve(args):
         sys.exit(1)
 
     _setup_logging(args.verbose)
-    cache, ttl = _make_cache(args)
-    app = create_app(cache=cache, ttl=ttl)
+    # A long-running server always caches; without --cache-file it is per-process memory.
+    cache, ttl, map_ttl = _make_cache(args, default_memory=True)
+    app = create_app(cache=cache, ttl=ttl, map_ttl=map_ttl)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

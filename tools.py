@@ -6,15 +6,48 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
-from cache import ResultCache
+from cache import ResultCache, UrlMap
 from parsers import (
-    HEADERS, _fetch, parse_shopify_rest, parse_json_ld,
+    HEADERS, NoProductError, _fetch, parse_shopify_rest, parse_json_ld,
     format_price, variant_name,
 )
 
 log = logging.getLogger(__name__)
 
 STOREFRONT_API_VERSION = os.environ.get("SHOPIFY_STOREFRONT_API_VERSION", "2026-07")
+
+
+def mapped_lookup(url_map: UrlMap | None, base: str, sku: str, fetch_match, name: str):
+    """Serve a SKU from its mapped product URL, skipping the search step.
+
+    ``fetch_match(url)`` returns the matching variant dict or None (page loads but has
+    no such SKU). The entry is dropped only when the product is really gone: a
+    404/410, a page with no product data, or a page without the SKU. Timeouts,
+    429s and 5xx keep it, since those say nothing about the mapping. Returns the
+    variant, or None to search.
+    """
+    url = url_map.get(base, sku) if url_map else None
+    if not url:
+        return None
+    try:
+        match = fetch_match(url)
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", None)
+        if status not in (404, 410):
+            log.debug("%s: mapped URL %s transient failure for %s (%s); keeping entry", name, url, sku, e)
+            return None
+    except NoProductError:
+        pass
+    except Exception as e:
+        log.debug("%s: mapped URL %s transient failure for %s (%s); keeping entry", name, url, sku, e)
+        return None
+    else:
+        if match:
+            log.debug("%s: URL map hit for %s -> %s", name, sku, url)
+            return match
+    log.debug("%s: dropping stale URL map entry for %s", name, sku)
+    url_map.delete(base, sku)
+    return None
 
 
 class SearchTool(ABC):
@@ -50,14 +83,21 @@ class CachedTool(SearchTool):
         return f"Cached[{self._tool.name}]"
 
     def _cached(self, key, fn):
-        hit = self._cache.get(key, self._ttl)
+        try:
+            hit = self._cache.get(key, self._ttl)
+        except Exception as e:
+            log.warning("%s: cache read failed (%s); treating as a miss", self.name, e)
+            hit = None
         if hit is not None:
             log.debug("%s: cache hit for %s", self.name, key)
             return hit, None
         log.debug("%s: cache miss for %s", self.name, key)
         result, error = fn()
         if result:
-            self._cache.set(key, result)
+            try:
+                self._cache.set(key, result)
+            except Exception as e:
+                log.warning("%s: cache write failed (%s); continuing", self.name, e)
         return result, error
 
     def search(self, query):
@@ -169,9 +209,10 @@ class ShopifyStorefrontTool(SearchTool):
     """
 
     def __init__(self, store_base_url: str, fallback: SearchTool | None = None,
-                 api_version: str = STOREFRONT_API_VERSION):
+                 api_version: str = STOREFRONT_API_VERSION, url_map: UrlMap | None = None):
         self.base = store_base_url
         self._fallback = fallback
+        self._url_map = url_map
         self._endpoint = f"{store_base_url}/api/{api_version}/graphql.json"
 
     def _graphql(self, query: str, variables: dict) -> dict:
@@ -227,11 +268,24 @@ class ShopifyStorefrontTool(SearchTool):
                     return self._to_result(p, match)
         return None
 
+    def _from_mapped_url(self, sku):
+        def fetch_match(url):
+            return next((v for v in parse_shopify_rest(url)
+                         if v["sku"].upper() == sku.upper()), None)
+        match = mapped_lookup(self._url_map, self.base, sku, fetch_match, self.name)
+        # Same source as a fresh search, so output doesn't change when the result cache expires.
+        return {**match, "source": "shopify_storefront"} if match else None
+
     def search(self, sku):
+        mapped = self._from_mapped_url(sku)
+        if mapped:
+            return mapped, None
         try:
             result = self._lookup(sku)
             if result:
                 log.debug("%s: Storefront search hit for %s", self.name, sku)
+                if self._url_map:
+                    self._url_map.set(self.base, sku, result["url"])
                 return result, None
             reason = f"SKU {sku} not found on {self.base}"
             log.debug("%s: Storefront search has no exact SKU match for %s", self.name, sku)
@@ -400,10 +454,22 @@ class BigCommerceSearchTool(SearchTool):
     Example: goBILDA
     """
 
-    def __init__(self, store_base_url: str):
+    def __init__(self, store_base_url: str, url_map: UrlMap | None = None):
         self.base = store_base_url
+        self._url_map = url_map
+
+    def _product(self, product_url, sku):
+        """Fetch a product page and return the variant matching sku, or None."""
+        r = _fetch(product_url)
+        results = parse_json_ld(product_url, r.text)
+        return next((v for v in results if v["sku"].upper() == sku.upper()), None)
 
     def search(self, sku):
+        mapped = mapped_lookup(self._url_map, self.base, sku,
+                               lambda url: self._product(url, sku), self.name)
+        if mapped:
+            return mapped, None
+
         try:
             r = _fetch(f"{self.base}/search.php?search_query={sku}")
         except Exception as e:
@@ -416,12 +482,12 @@ class BigCommerceSearchTool(SearchTool):
         product_url = card["href"].split("?")[0]
         log.debug("%s: search page first hit %s", self.name, product_url)
         try:
-            r2 = _fetch(product_url)
-            results = parse_json_ld(product_url, r2.text)
-            match = next((v for v in results if v["sku"].upper() == sku.upper()), None)
+            match = self._product(product_url, sku)
             if not match:
                 return None, f"SKU mismatch: {sku} not found in search results"
             log.debug("%s: JSON-LD hit for %s", self.name, sku)
+            if self._url_map:
+                self._url_map.set(self.base, sku, product_url)
             return match, None
         except Exception as e:
             return None, str(e)

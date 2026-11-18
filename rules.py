@@ -1,6 +1,6 @@
 import logging
 import re
-from cache import ResultCache
+from cache import ResultCache, UrlMap
 from tools import (
     SearchTool, CachedTool, GenericUrlTool,
     ShopifyHandleTool, ShopifyStorefrontTool, ShopifyCatalogTool,
@@ -34,17 +34,22 @@ class Rule:
 def build_rules(
     cache: ResultCache | None = None,
     ttl: float | None = None,
+    map_ttl: float | None = None,
 ) -> list[Rule]:
+    # Two cache layers over one backend: short-lived results (price/stock) and
+    # long-lived SKU -> product URL mappings that skip the search step.
+    url_map = UrlMap(cache, map_ttl) if cache else None
+
     def w(tool, cacheable=True):
         return CachedTool(tool, cache, ttl) if (cache and cacheable) else tool
 
     def storefront(base):
         # Storefront search first; the old full-catalog crawl is the last resort.
-        return ShopifyStorefrontTool(base, fallback=ShopifyCatalogTool(base))
+        return ShopifyStorefrontTool(base, fallback=ShopifyCatalogTool(base), url_map=url_map)
 
     return [
         Rule(w(ShopifyHandleTool("https://wcproducts.com",
-                                 fallback=ShopifyStorefrontTool("https://wcproducts.com"))),
+                                 fallback=ShopifyStorefrontTool("https://wcproducts.com", url_map=url_map))),
              sku(r"^wcp-\d+$"),            domain(r"wcproducts\.com")),
         Rule(w(storefront("https://www.andymark.com")),
              sku(r"^am-\d+"),              domain(r"andymark\.com")),
@@ -52,7 +57,7 @@ def build_rules(
              sku(r"^rev-\d+-\d+"),         domain(r"revrobotics\.com")),
         Rule(w(storefront("https://www.thethriftybot.com")),
              sku(r"^ttb-\d+"),             domain(r"thethriftybot\.com")),
-        Rule(w(BigCommerceSearchTool("https://www.gobilda.com")),
+        Rule(w(BigCommerceSearchTool("https://www.gobilda.com", url_map=url_map)),
              sku(r"^\d{4}-\d{4}-\d{4}$"), domain(r"gobilda\.com")),
     ]
 
