@@ -3,8 +3,11 @@ from unittest import mock
 
 import requests
 
+from cache import MemoryCache, FileCache, UrlMap
 from parsers import format_cents, parse_shopify_rest
-from tools import ShopifyCatalogTool, ShopifyStorefrontTool
+from tools import (
+    CachedTool, ShopifyCatalogTool, ShopifyStorefrontTool, BigCommerceSearchTool,
+)
 
 
 def _resp(status=200, payload=None, json_error=False):
@@ -119,6 +122,110 @@ class StorefrontTest(unittest.TestCase):
         ]
         r, e = ShopifyStorefrontTool("https://s.com").search("AM-2")
         self.assertEqual(r["sku"], "AM-2")
+
+
+class UrlMapTest(unittest.TestCase):
+    def test_roundtrip_delete_and_ttl(self):
+        m = UrlMap(MemoryCache(), ttl=100)
+        m.set("s", "am-1", "https://s.com/products/a")
+        self.assertEqual(m.get("s", "AM-1"), "https://s.com/products/a")
+        m.delete("s", "am-1")
+        self.assertIsNone(m.get("s", "am-1"))
+        m.set("s", "am-1", "https://s.com/products/a")
+        with mock.patch("cache.time.time", return_value=10**10):
+            self.assertIsNone(m.get("s", "am-1"))
+
+    def test_file_cache_delete(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            c = FileCache(os.path.join(d, "c.json"))
+            c.delete("missing")
+            c.set("k", {"url": "u"})
+            c.delete("k")
+            self.assertIsNone(c.get("k", None))
+
+
+class StorefrontUrlMapTest(StorefrontTest):
+    """Reuses StorefrontTest's node builder; checks the SKU -> URL cache layer."""
+
+    def setUp(self):
+        self.map = UrlMap(MemoryCache(), ttl=None)
+        self.tool = ShopifyStorefrontTool("https://s.com", url_map=self.map)
+
+    def _js(self, sku):
+        return mock.Mock(json=mock.Mock(return_value={
+            "title": "T", "variants": [{"sku": sku, "title": "Default Title",
+                                        "price": 100, "available": True}]}))
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_second_lookup_skips_search(self, post, fetch):
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [self._node("h", ["AM-2"])]}}})
+        fetch.return_value = self._js("AM-2")
+        self.tool.search("AM-2")
+        self.assertEqual(self.map.get("https://s.com", "AM-2"), "https://s.com/products/h")
+        r, e = self.tool.search("AM-2")
+        self.assertEqual(post.call_count, 1)
+        fetch.assert_called_once_with("https://s.com/products/h.js")
+        self.assertEqual(r["sku"], "AM-2")
+        self.assertEqual(r["price"], "1.00")
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_stale_mapping_is_dropped_and_researched(self, post, fetch):
+        self.map.set("https://s.com", "AM-2", "https://s.com/products/gone")
+        fetch.side_effect = requests.HTTPError("HTTP 404")
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [self._node("new", ["AM-2"])]}}})
+        r, e = self.tool.search("AM-2")
+        self.assertEqual(r["url"], "https://s.com/products/new")
+        self.assertEqual(self.map.get("https://s.com", "AM-2"), "https://s.com/products/new")
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_mapping_with_sku_mismatch_is_dropped(self, post, fetch):
+        self.map.set("https://s.com", "AM-2", "https://s.com/products/old")
+        fetch.return_value = self._js("OTHER")
+        post.return_value = _resp(200, {"data": {"search": {"nodes": []}}})
+        r, e = self.tool.search("AM-2")
+        self.assertIsNone(r)
+        self.assertIsNone(self.map.get("https://s.com", "AM-2"))
+
+
+class BigCommerceUrlMapTest(unittest.TestCase):
+    LD = ('<script type="application/ld+json">{"@type":"Product","name":"N",'
+          '"offers":[{"sku":"1000-0001-0001","price":"1","url":"u"}]}</script>')
+    SEARCH = '<li class="product"><a class="card" href="https://g.com/p/?x=1">p</a></li>'
+
+    @mock.patch("tools._fetch")
+    def test_mapped_lookup_skips_search_page(self, fetch):
+        m = UrlMap(MemoryCache(), ttl=None)
+        tool = BigCommerceSearchTool("https://g.com", url_map=m)
+        fetch.side_effect = [mock.Mock(text=self.SEARCH), mock.Mock(text=self.LD)]
+        tool.search("1000-0001-0001")
+        self.assertEqual(m.get("https://g.com", "1000-0001-0001"), "https://g.com/p/")
+        fetch.reset_mock()
+        fetch.side_effect = [mock.Mock(text=self.LD)]
+        r, e = tool.search("1000-0001-0001")
+        fetch.assert_called_once_with("https://g.com/p/")
+        self.assertEqual(r["sku"], "1000-0001-0001")
+
+
+class TwoLayerCacheTest(unittest.TestCase):
+    def test_result_expires_while_mapping_survives(self):
+        cache = MemoryCache()
+        m = UrlMap(cache, ttl=7 * 86400)
+        m.set("s", "A", "https://s.com/products/a")
+        inner = mock.Mock()
+        inner.name = "inner"
+        inner.search.return_value = ({"sku": "A"}, None)
+        tool = CachedTool(inner, cache, ttl=600)
+        tool.search("A")
+        tool.search("A")
+        self.assertEqual(inner.search.call_count, 1)
+        with mock.patch("cache.time.time", return_value=__import__("time").time() + 3600):
+            tool.search("A")
+            self.assertEqual(inner.search.call_count, 2)
+            self.assertEqual(m.get("s", "A"), "https://s.com/products/a")
 
 
 if __name__ == "__main__":

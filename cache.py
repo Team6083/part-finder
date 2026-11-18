@@ -13,6 +13,10 @@ class ResultCache(ABC):
     def set(self, key: str, result: dict) -> None:
         """Store a result dict with the current timestamp."""
 
+    @abstractmethod
+    def delete(self, key: str) -> None:
+        """Remove a key; a missing key is not an error."""
+
 
 def _entry(result: dict) -> dict:
     return {"result": result, "cached_at": time.time()}
@@ -36,6 +40,9 @@ class MemoryCache(ResultCache):
     def set(self, key, result):
         self._store[key] = _entry(result)
 
+    def delete(self, key):
+        self._store.pop(key, None)
+
 
 class FileCache(ResultCache):
     def __init__(self, path):
@@ -55,3 +62,39 @@ class FileCache(ResultCache):
         existing[key] = _entry(result)
         with self._path.open("w") as f:
             json.dump(existing, f)
+
+    def delete(self, key):
+        if not self._path.exists():
+            return
+        with self._path.open() as f:
+            existing = json.load(f)
+        if existing.pop(key, None) is not None:
+            with self._path.open("w") as f:
+                json.dump(existing, f)
+
+
+class UrlMap:
+    """SKU -> product URL lookup layered on a ResultCache (long TTL).
+
+    Lets a tool skip its search step: a hit goes straight to the product page.
+    Keys are prefixed so they never collide with result-cache keys.
+    """
+
+    PREFIX = "map:"
+
+    def __init__(self, cache: ResultCache, ttl: float | None = None):
+        self._cache = cache
+        self._ttl = ttl
+
+    def _key(self, store: str, sku: str) -> str:
+        return f"{self.PREFIX}{store}|{sku.upper()}"
+
+    def get(self, store: str, sku: str) -> str | None:
+        hit = self._cache.get(self._key(store, sku), self._ttl)
+        return hit["url"] if hit else None
+
+    def set(self, store: str, sku: str, url: str) -> None:
+        self._cache.set(self._key(store, sku), {"url": url})
+
+    def delete(self, store: str, sku: str) -> None:
+        self._cache.delete(self._key(store, sku))

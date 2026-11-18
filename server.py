@@ -24,13 +24,14 @@ class BatchRequest(BaseModel):
     queries: List[str]
 
 
-def create_app(cache: ResultCache | None = None, ttl: float | None = None) -> FastAPI:
+def create_app(cache: ResultCache | None = None, ttl: float | None = None,
+               map_ttl: float | None = None) -> FastAPI:
     app = FastAPI(
         title="Part Finder",
         description="Robotics parts price and stock lookup.",
         version="0.1.0",
     )
-    rules = build_rules(cache, ttl)
+    rules = build_rules(cache, ttl, map_ttl)
 
     def _lookup(q: str) -> list[dict]:
         search_fn, query = resolve(q, rules)
