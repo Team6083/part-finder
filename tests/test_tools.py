@@ -345,6 +345,60 @@ class BigCommerceDirectPageTest(unittest.TestCase):
         self.assertEqual(fetch.call_count, 3)
 
 
+class BigCommerceReviewFollowUpTest(unittest.TestCase):
+    URL = "https://r.com/p/"
+
+    @staticmethod
+    def _page(ld_sku, *labels):
+        radios = "".join(f'<label data-product-attribute-value="{i}" for="attribute_radio_9_{i}">{l}</label>'
+                         for i, l in enumerate(labels, 1))
+        sku = f'"sku":"{ld_sku}",' if ld_sku is not None else ""
+        return ('<h1>P</h1><input name="product_id" value="7">' + radios +
+                '<script type="application/ld+json">{"@type":"Product","name":"P",' + sku +
+                '"offers":{"price":"5","url":"u"}}</script>')
+
+    @staticmethod
+    def _api(sku):
+        return _resp(200, {"data": {"sku": sku, "instock": True, "price": {"without_tax": {"value": 5}}}})
+
+    def _tool(self):
+        return BigCommerceSearchTool("https://r.com")
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_json_ld_sku_that_is_an_option_means_variants(self, fetch, post):
+        # JSON-LD only shows the default variant (REV /1in-extrusion/): list every option.
+        fetch.return_value = mock.Mock(text=self._page("REV-21-1000", "(REV-21-1000) A", "(REV-21-1404) B"))
+        post.side_effect = [self._api("REV-21-1000"), self._api("REV-21-1404")]
+        r, e = self._tool().search_url(self.URL)
+        self.assertEqual([v["sku"] for v in r], ["REV-21-1000", "REV-21-1404"])
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_missing_json_ld_sku_still_queries_options(self, fetch, post):
+        fetch.return_value = mock.Mock(text=self._page(None, "Kit (REV-21-2108)"))
+        post.return_value = self._api("REV-21-2108")
+        r, e = self._tool().search_url(self.URL)
+        self.assertEqual([v["sku"] for v in r], ["REV-21-2108"])
+
+    @mock.patch("tools._fetch")
+    def test_multipack_json_ld_sku_matches_base_sku(self, fetch):
+        fetch.return_value = mock.Mock(text=self._page("REV-11-1228-PK10"))
+        v = self._tool()._product(self.URL, "REV-11-1228")
+        self.assertEqual(v["sku"], "REV-11-1228-PK10")
+
+    @mock.patch("tools._fetch")
+    def test_other_sku_still_mismatches(self, fetch):
+        fetch.return_value = mock.Mock(text=self._page("REV-11-1228-PK10"))
+        self.assertIsNone(self._tool()._product(self.URL, "REV-11-12"))
+
+    def test_label_sku_ignores_parenthesised_words(self):
+        f = BigCommerceSearchTool._label_sku
+        self.assertEqual(f("Spacer (Non-Locking) (REV-21-1234)"), "REV-21-1234")
+        self.assertEqual(f("(REV-21-2809) Shaft"), "REV-21-2809")
+        self.assertIsNone(f("Spacer (Mid-Pack)"))
+
+
 class MappedLookupFailureTest(unittest.TestCase):
     """Only a gone product drops a mapping; transient errors and cache faults must not."""
 

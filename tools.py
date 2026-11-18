@@ -524,7 +524,7 @@ class BigCommerceSearchTool(SearchTool):
     @staticmethod
     def _label_sku(label):
         """SKU in parentheses anywhere in an option label: "Kit (REV-21-2108)" or "(REV-21-2809) Shaft"."""
-        m = re.search(r"\(([A-Za-z]{2,}-[\w-]+)\)", label)
+        m = re.search(r"\(([A-Za-z]{2,}-\d[\w-]*)\)", label)
         return m[1] if m else None
 
     def _variant(self, url, pid, name, attr, value, label):
@@ -599,6 +599,10 @@ class BigCommerceSearchTool(SearchTool):
         variants = self._variants(product_url, r.text, sku)
         if variants:
             return variants[0]
+        # Multi-packs are listed as REV-11-1228-PK10; same fallback as for option labels.
+        pack = next((v for v in results if str(v["sku"]).upper().startswith(sku.upper() + "-PK")), None)
+        if pack:
+            return pack
         if not results:
             raise NoProductError("No JSON-LD Product found")
         return None
@@ -611,9 +615,13 @@ class BigCommerceSearchTool(SearchTool):
             except NoProductError:
                 results = []
             _, _, options = self._options(r.text)
-            # A bare integer SKU is BigCommerce's product id: the JSON-LD has no real SKU, so the
-            # variants are only reachable per option. A real SKU wins; options are then add-ons.
-            if options and all(str(v["sku"]).isdigit() for v in results):
+            label_skus = {(self._label_sku(l) or "").upper() for _, _, l in options} - {""}
+            # No real SKU in the JSON-LD (BigCommerce's bare product id, or none): the variants are
+            # only reachable per option. A real SKU that is itself one of the options means the
+            # JSON-LD only shows the default variant. A real SKU the options don't list means the
+            # options are add-ons (e.g. REV-11-2158's data port cover), not variants of this page.
+            if options and all(not str(v["sku"]) or str(v["sku"]).isdigit()
+                               or str(v["sku"]).upper() in label_skus for v in results):
                 variants = self._variants(url, r.text)
                 if variants:
                     return variants, None

@@ -38,6 +38,7 @@ SKUS = {
     "REV-11-2159":    ("REV",       False),
     "REV-21-1652":    ("REV",       False),
     "REV-11-2158":    ("REV",       False),  # page also has an add-on option: must not be mistaken for a variant
+    "REV-11-1228":    ("REV",       False),  # page SKU is REV-11-1228-PK10: matched by the -PKn fallback
     # REV, variant SKUs: /<sku>/ 404s, so search, then the option API; the URL map skips the search
     "REV-21-2108":    ("REV",       True),   # option label ends with the SKU: "Kit (REV-21-2108)"
     "REV-21-2809":    ("REV",       True),   # option label starts with the SKU: "(REV-21-2809) ..."
