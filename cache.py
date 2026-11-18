@@ -1,7 +1,13 @@
 import json
+import logging
+import os
+import tempfile
+import threading
 import time
 import pathlib
 from abc import ABC, abstractmethod
+
+log = logging.getLogger(__name__)
 
 
 class ResultCache(ABC):
@@ -45,32 +51,52 @@ class MemoryCache(ResultCache):
 
 
 class FileCache(ResultCache):
+    """JSON-file cache. Safe for concurrent threads: writes are serialized and
+    atomic (temp file + rename), and an unreadable file counts as an empty cache."""
+
     def __init__(self, path):
         self._path = pathlib.Path(path)
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict:
+        try:
+            with self._path.open() as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as e:
+            log.warning("cache file %s unreadable (%s); treating as empty", self._path, e)
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save(self, data: dict) -> None:
+        fd, tmp = tempfile.mkstemp(dir=self._path.parent or ".", prefix=self._path.name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self._path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def get(self, key, ttl=None):
-        if not self._path.exists():
-            return None
-        with self._path.open() as f:
-            return _read_entry(json.load(f).get(key), ttl)
+        with self._lock:
+            return _read_entry(self._load().get(key), ttl)
 
     def set(self, key, result):
-        existing = {}
-        if self._path.exists():
-            with self._path.open() as f:
-                existing = json.load(f)
-        existing[key] = _entry(result)
-        with self._path.open("w") as f:
-            json.dump(existing, f)
+        with self._lock:
+            data = self._load()
+            data[key] = _entry(result)
+            self._save(data)
 
     def delete(self, key):
-        if not self._path.exists():
-            return
-        with self._path.open() as f:
-            existing = json.load(f)
-        if existing.pop(key, None) is not None:
-            with self._path.open("w") as f:
-                json.dump(existing, f)
+        with self._lock:
+            data = self._load()
+            if data.pop(key, None) is not None:
+                self._save(data)
 
 
 class UrlMap:
@@ -90,11 +116,21 @@ class UrlMap:
         return f"{self.PREFIX}{store}|{sku.upper()}"
 
     def get(self, store: str, sku: str) -> str | None:
-        hit = self._cache.get(self._key(store, sku), self._ttl)
+        try:
+            hit = self._cache.get(self._key(store, sku), self._ttl)
+        except Exception as e:
+            log.warning("URL map read failed (%s); treating as a miss", e)
+            return None
         return hit["url"] if hit else None
 
     def set(self, store: str, sku: str, url: str) -> None:
-        self._cache.set(self._key(store, sku), {"url": url})
+        try:
+            self._cache.set(self._key(store, sku), {"url": url})
+        except Exception as e:
+            log.warning("URL map write failed (%s); continuing without it", e)
 
     def delete(self, store: str, sku: str) -> None:
-        self._cache.delete(self._key(store, sku))
+        try:
+            self._cache.delete(self._key(store, sku))
+        except Exception as e:
+            log.warning("URL map delete failed (%s); continuing", e)

@@ -82,12 +82,19 @@ class CatalogRetryTest(unittest.TestCase):
         self.assertEqual(result["sku"], "A-1")
 
 
+def _node(handle, skus, has_next=False):
+    return {"handle": handle, "title": handle, "variants": {
+        "pageInfo": {"hasNextPage": has_next, "endCursor": "c"},
+        "nodes": [{"sku": s, "title": "Default Title", "availableForSale": True,
+                   "price": {"amount": "167.0"}} for s in skus]}}
+
+
+def _http_error(status):
+    return requests.HTTPError(f"HTTP {status}", response=mock.Mock(status_code=status))
+
+
 class StorefrontTest(unittest.TestCase):
-    def _node(self, handle, skus, has_next=False):
-        return {"handle": handle, "title": handle, "variants": {
-            "pageInfo": {"hasNextPage": has_next, "endCursor": "c"},
-            "nodes": [{"sku": s, "title": "Default Title", "availableForSale": True,
-                       "price": {"amount": "167.0"}} for s in skus]}}
+    _node = staticmethod(_node)
 
     @mock.patch("tools.requests.post")
     def test_requires_exact_sku_match(self, post):
@@ -145,8 +152,9 @@ class UrlMapTest(unittest.TestCase):
             self.assertIsNone(c.get("k", None))
 
 
-class StorefrontUrlMapTest(StorefrontTest):
-    """Reuses StorefrontTest's node builder; checks the SKU -> URL cache layer."""
+class StorefrontUrlMapTest(unittest.TestCase):
+    """Checks the SKU -> URL cache layer."""
+    _node = staticmethod(_node)
 
     def setUp(self):
         self.map = UrlMap(MemoryCache(), ttl=None)
@@ -174,7 +182,7 @@ class StorefrontUrlMapTest(StorefrontTest):
     @mock.patch("tools.requests.post")
     def test_stale_mapping_is_dropped_and_researched(self, post, fetch):
         self.map.set("https://s.com", "AM-2", "https://s.com/products/gone")
-        fetch.side_effect = requests.HTTPError("HTTP 404")
+        fetch.side_effect = _http_error(404)
         post.return_value = _resp(200, {"data": {"search": {"nodes": [self._node("new", ["AM-2"])]}}})
         r, e = self.tool.search("AM-2")
         self.assertEqual(r["url"], "https://s.com/products/new")
@@ -208,6 +216,105 @@ class BigCommerceUrlMapTest(unittest.TestCase):
         r, e = tool.search("1000-0001-0001")
         fetch.assert_called_once_with("https://g.com/p/")
         self.assertEqual(r["sku"], "1000-0001-0001")
+
+
+class MappedLookupFailureTest(unittest.TestCase):
+    """Only a gone product drops a mapping; transient errors and cache faults must not."""
+
+    URL = "https://s.com/products/h"
+
+    def setUp(self):
+        self.map = UrlMap(MemoryCache(), ttl=None)
+        self.map.set("https://s.com", "AM-2", self.URL)
+        self.tool = ShopifyStorefrontTool("https://s.com", url_map=self.map)
+
+    def _search_hit(self, post):
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [_node("h", ["AM-2"])]}}})
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_transient_errors_keep_mapping(self, post, fetch):
+        # Search finds nothing, so a surviving entry proves it was never deleted
+        # (a successful search would re-store it and hide the bug).
+        post.return_value = _resp(200, {"data": {"search": {"nodes": []}}})
+        for err in (requests.Timeout("slow"), _http_error(429), _http_error(503)):
+            fetch.side_effect = err
+            self.tool.search("AM-2")
+            self.assertEqual(self.map.get("https://s.com", "AM-2"), self.URL)
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_410_drops_mapping(self, post, fetch):
+        post.return_value = _resp(200, {"data": {"search": {"nodes": []}}})
+        fetch.side_effect = _http_error(410)
+        self.tool.search("AM-2")
+        self.assertIsNone(self.map.get("https://s.com", "AM-2"))
+
+    @mock.patch("tools._fetch")
+    def test_goBILDA_timeout_keeps_mapping(self, fetch):
+        m = UrlMap(MemoryCache(), ttl=None)
+        m.set("https://g.com", "1000-0001-0001", "https://g.com/p/")
+        fetch.side_effect = requests.Timeout("slow")
+        BigCommerceSearchTool("https://g.com", url_map=m).search("1000-0001-0001")
+        self.assertEqual(m.get("https://g.com", "1000-0001-0001"), "https://g.com/p/")
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_broken_cache_does_not_break_lookup(self, post, fetch):
+        class Broken(MemoryCache):
+            def get(self, *a, **k):
+                raise OSError("disk")
+            set = delete = get
+        tool = ShopifyStorefrontTool("https://s.com", url_map=UrlMap(Broken(), ttl=None))
+        self._search_hit(post)
+        r, e = tool.search("AM-2")
+        self.assertIsNone(e)
+        self.assertEqual(r["sku"], "AM-2")
+
+    def test_cached_tool_survives_broken_cache(self):
+        class Broken(MemoryCache):
+            def get(self, *a, **k):
+                raise OSError("disk")
+            set = get
+        inner = mock.Mock()
+        inner.name = "inner"
+        inner.search.return_value = ({"sku": "A"}, None)
+        r, e = CachedTool(inner, Broken(), ttl=60).search("A")
+        self.assertEqual(r, {"sku": "A"})
+
+
+class FileCacheRobustnessTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile, os
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "c.json")
+
+    def test_corrupt_file_is_an_empty_cache(self):
+        with open(self.path, "w") as f:
+            f.write('{"a": {"result"')
+        c = FileCache(self.path)
+        self.assertIsNone(c.get("a", None))
+        c.set("b", {"x": 1})
+        self.assertEqual(c.get("b", None), {"x": 1})
+
+    def test_concurrent_writes_lose_nothing(self):
+        import threading
+        c = FileCache(self.path)
+        threads = [threading.Thread(target=c.set, args=(f"k{i}", {"i": i})) for i in range(40)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual([c.get(f"k{i}", None) for i in range(40)],
+                         [{"i": i} for i in range(40)])
+
+    def test_no_temp_files_left_behind(self):
+        import os
+        c = FileCache(self.path)
+        c.set("a", {"x": 1})
+        c.delete("a")
+        self.assertEqual(os.listdir(self.dir.name), ["c.json"])
 
 
 class TwoLayerCacheTest(unittest.TestCase):

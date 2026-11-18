@@ -17,6 +17,36 @@ log = logging.getLogger(__name__)
 STOREFRONT_API_VERSION = os.environ.get("SHOPIFY_STOREFRONT_API_VERSION", "2026-07")
 
 
+def mapped_lookup(url_map: UrlMap | None, base: str, sku: str, fetch_match, name: str):
+    """Serve a SKU from its mapped product URL, skipping the search step.
+
+    ``fetch_match(url)`` returns the matching variant dict or None (page loads but has
+    no such SKU). The entry is dropped only when the product is really gone: a
+    404/410, or a page without the SKU. Timeouts, 429s and 5xx keep it, since
+    those say nothing about the mapping. Returns the variant, or None to search.
+    """
+    url = url_map.get(base, sku) if url_map else None
+    if not url:
+        return None
+    try:
+        match = fetch_match(url)
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", None)
+        if status not in (404, 410):
+            log.debug("%s: mapped URL %s transient failure for %s (%s); keeping entry", name, url, sku, e)
+            return None
+    except Exception as e:
+        log.debug("%s: mapped URL %s transient failure for %s (%s); keeping entry", name, url, sku, e)
+        return None
+    else:
+        if match:
+            log.debug("%s: URL map hit for %s -> %s", name, sku, url)
+            return match
+    log.debug("%s: dropping stale URL map entry for %s", name, sku)
+    url_map.delete(base, sku)
+    return None
+
+
 class SearchTool(ABC):
     @property
     def name(self) -> str:
@@ -50,14 +80,21 @@ class CachedTool(SearchTool):
         return f"Cached[{self._tool.name}]"
 
     def _cached(self, key, fn):
-        hit = self._cache.get(key, self._ttl)
+        try:
+            hit = self._cache.get(key, self._ttl)
+        except Exception as e:
+            log.warning("%s: cache read failed (%s); treating as a miss", self.name, e)
+            hit = None
         if hit is not None:
             log.debug("%s: cache hit for %s", self.name, key)
             return hit, None
         log.debug("%s: cache miss for %s", self.name, key)
         result, error = fn()
         if result:
-            self._cache.set(key, result)
+            try:
+                self._cache.set(key, result)
+            except Exception as e:
+                log.warning("%s: cache write failed (%s); continuing", self.name, e)
         return result, error
 
     def search(self, query):
@@ -229,21 +266,10 @@ class ShopifyStorefrontTool(SearchTool):
         return None
 
     def _from_mapped_url(self, sku):
-        """Skip the search when the SKU's product URL is known. Returns a result or None."""
-        url = self._url_map.get(self.base, sku) if self._url_map else None
-        if not url:
-            return None
-        try:
-            match = next((v for v in parse_shopify_rest(url)
-                          if v["sku"].upper() == sku.upper()), None)
-            if match:
-                log.debug("%s: URL map hit for %s -> %s", self.name, sku, url)
-                return match
-        except Exception as e:
-            log.debug("%s: mapped URL %s failed for %s (%s)", self.name, url, sku, e)
-        log.debug("%s: dropping stale URL map entry for %s", self.name, sku)
-        self._url_map.delete(self.base, sku)
-        return None
+        def fetch_match(url):
+            return next((v for v in parse_shopify_rest(url)
+                         if v["sku"].upper() == sku.upper()), None)
+        return mapped_lookup(self._url_map, self.base, sku, fetch_match, self.name)
 
     def search(self, sku):
         mapped = self._from_mapped_url(sku)
@@ -434,17 +460,10 @@ class BigCommerceSearchTool(SearchTool):
         return next((v for v in results if v["sku"].upper() == sku.upper()), None)
 
     def search(self, sku):
-        mapped = self._url_map.get(self.base, sku) if self._url_map else None
+        mapped = mapped_lookup(self._url_map, self.base, sku,
+                               lambda url: self._product(url, sku), self.name)
         if mapped:
-            try:
-                match = self._product(mapped, sku)
-                if match:
-                    log.debug("%s: URL map hit for %s -> %s", self.name, sku, mapped)
-                    return match, None
-            except Exception as e:
-                log.debug("%s: mapped URL %s failed for %s (%s)", self.name, mapped, sku, e)
-            log.debug("%s: dropping stale URL map entry for %s", self.name, sku)
-            self._url_map.delete(self.base, sku)
+            return mapped, None
 
         try:
             r = _fetch(f"{self.base}/search.php?search_query={sku}")
