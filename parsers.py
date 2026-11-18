@@ -56,7 +56,7 @@ def _check_url(url: str) -> None:
         raise FetchError(f"host not allowed: {host}")
 
 
-def _read_capped(r, max_bytes: int) -> None:
+def read_capped(r, max_bytes: int) -> None:
     length = r.headers.get("Content-Length", "")
     if length.isdigit() and int(length) > max_bytes:
         r.close()
@@ -75,12 +75,14 @@ def safe_get(url, max_bytes=MAX_BODY_BYTES, timeout=10):
     for _ in range(MAX_REDIRECTS + 1):
         _check_url(url)
         r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=False, stream=True)
-        location = r.headers.get("Location")
-        if r.status_code in _REDIRECT_CODES and location:
+        if r.status_code in _REDIRECT_CODES:
+            location = r.headers.get("Location")
             r.close()
+            if not location:
+                raise FetchError("redirect without Location")
             url = urljoin(url, location)
             continue
-        _read_capped(r, max_bytes)
+        read_capped(r, max_bytes)
         return r
     raise FetchError("too many redirects")
 

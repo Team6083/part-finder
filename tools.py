@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 from cache import ResultCache, UrlMap
 from parsers import (
-    HEADERS, NoProductError, _fetch, safe_get, parse_shopify_rest, parse_json_ld,
+    HEADERS, MAX_BODY_BYTES, FetchError, NoProductError, _fetch, read_capped, safe_get, parse_shopify_rest, parse_json_ld,
     format_price, variant_name,
 )
 
@@ -111,7 +111,8 @@ class CachedTool(SearchTool):
         return self._cached(query, lambda: self._tool.search(query))
 
     def search_url(self, url):
-        return self._cached(normalize_url(url), lambda: self._tool.search_url(url))
+        u = normalize_url(url)
+        return self._cached(u, lambda: self._tool.search_url(u))
 
 
 class GenericUrlTool(SearchTool):
@@ -229,8 +230,10 @@ class ShopifyStorefrontTool(SearchTool):
             headers={**HEADERS, "Content-Type": "application/json"},
             timeout=10,
             allow_redirects=False,
+            stream=True,
         )
         r.raise_for_status()
+        read_capped(r, MAX_BODY_BYTES)
         body = r.json()
         if body.get("errors"):
             raise ValueError(f"GraphQL errors: {body['errors']}")
@@ -355,6 +358,8 @@ class ShopifyCatalogTool(SearchTool):
                     continue
                 r.raise_for_status()
                 return r.json().get("products", [])
+            except FetchError:
+                raise
             except (requests.RequestException, ValueError) as e:
                 last_error = str(e)
         raise RuntimeError(
@@ -397,16 +402,18 @@ class ShopifyCatalogTool(SearchTool):
                     by_handle[p["handle"]] = handle_results
             page += 1
             time.sleep(self.PAGE_DELAY)
-        self._catalog = catalog
         self._by_handle = by_handle
+        self._catalog = catalog
         log.debug("%s: built catalog with %d SKUs", self.name, len(catalog))
 
     def _ensure(self):
-        """Build the catalog once: concurrent callers wait on one build, and a failed build
-        is not retried until COOLDOWN has passed (callers get the same error meanwhile)."""
+        """Build the catalog in one thread; concurrent callers fail fast instead of waiting.
+        A failed build is not retried until COOLDOWN has passed (callers get the same error)."""
         if self._catalog is not None:
             return
-        with self._lock:
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("catalog build in progress")
+        try:
             if self._catalog is not None:
                 return
             if self._failed_at is not None and time.monotonic() - self._failed_at < self.COOLDOWN:
@@ -418,6 +425,8 @@ class ShopifyCatalogTool(SearchTool):
                 self._failure = str(e)
                 raise
             self._failed_at = None
+        finally:
+            self._lock.release()
 
     def search(self, sku):
         try:

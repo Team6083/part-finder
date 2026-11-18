@@ -42,6 +42,8 @@ class MemoryCache(ResultCache):
     """Thread-safe in-memory cache bounded to max_entries, evicting least recently used."""
 
     def __init__(self, max_entries: int = 10_000):
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be >= 1, got {max_entries}")
         self._max = max_entries
         self._store: OrderedDict = OrderedDict()
         self._lock = threading.Lock()

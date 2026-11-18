@@ -5,9 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py .
-
 RUN useradd --system --uid 10001 --no-create-home app
+COPY --chown=app *.py .
+RUN chown app /app
 USER app
 
 ENV PORT=8000

@@ -5,7 +5,7 @@ import logging
 import os
 from typing import Annotated, List
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
-from pydantic import BaseModel, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, create_model
 
 from cache import ResultCache
 from parsers import set_allowed_hosts
@@ -29,8 +29,7 @@ class LookupResult(BaseModel):
     error: str = ""
 
 
-class BatchRequest(BaseModel):
-    queries: List[Annotated[str, StringConstraints(max_length=MAX_QUERY_LEN)]]
+QueryStr = Annotated[str, StringConstraints(max_length=MAX_QUERY_LEN)]
 
 
 def _public_error(error: str) -> str:
@@ -50,7 +49,11 @@ def create_app(cache: ResultCache | None = None, ttl: float | None = None,
         version="0.1.0",
     )
     api_key = api_key if api_key is not None else os.environ.get("PART_FINDER_API_KEY") or None
-    max_batch = max_batch or int(os.environ.get("PART_FINDER_MAX_BATCH", DEFAULT_MAX_BATCH))
+    if max_batch is None:
+        max_batch = int(os.environ.get("PART_FINDER_MAX_BATCH", DEFAULT_MAX_BATCH))
+    if max_batch < 1:
+        raise ValueError(f"PART_FINDER_MAX_BATCH must be >= 1, got {max_batch}")
+    BatchRequest = create_model("BatchRequest", queries=(List[QueryStr], Field(max_length=max_batch)))
     rules = build_rules(cache, ttl, map_ttl)
     # Only store hosts may be fetched, including every redirect hop.
     set_allowed_hosts(allowed_hosts(rules))
@@ -82,12 +85,13 @@ def create_app(cache: ResultCache | None = None, ttl: float | None = None,
         """Look up a part by SKU or URL. Returns all variants if a URL is given."""
         return _lookup(q)
 
-    @router.post("/lookup", response_model=List[LookupResult])
-    def lookup_batch(req: BatchRequest):
+    def lookup_batch(req):
         """Look up multiple parts. Results are flattened into a single list."""
-        if len(req.queries) > max_batch:
-            raise HTTPException(status_code=422, detail=f"too many queries (max {max_batch})")
         return [item for q in req.queries for item in _lookup(q)]
+
+    # Set explicitly: the model is built per app, so a string annotation could not resolve it.
+    lookup_batch.__annotations__["req"] = BatchRequest
+    router.post("/lookup", response_model=List[LookupResult])(lookup_batch)
 
     app.include_router(router, prefix="/api/v1")
     # Unversioned paths kept for existing callers.

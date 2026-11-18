@@ -10,7 +10,8 @@ from cache import MemoryCache
 from parsers import FetchError, _fetch, set_allowed_hosts
 from rules import UnsupportedInput, allowed_hosts, build_rules, resolve
 from server import create_app
-from tools import CachedTool, GenericUrlTool, ShopifyCatalogTool, normalize_url
+from tools import CachedTool, GenericUrlTool, ShopifyCatalogTool, ShopifyStorefrontTool, normalize_url, mapped_lookup
+from cache import UrlMap
 
 
 def _redirect(location, status=302):
@@ -146,6 +147,21 @@ class ServerLimitsTest(HostPolicyMixin, unittest.TestCase):
         self.assertEqual(client.post("/api/v1/lookup", json={"queries": ["nope"] * 3}).status_code, 200)
         self.assertEqual(client.post("/api/v1/lookup", json={"queries": ["nope"] * 4}).status_code, 422)
 
+    def test_oversized_batch_rejected_by_model(self):
+        client = TestClient(create_app(max_batch=2))
+        r = client.post("/api/v1/lookup", json={"queries": ["a"] * 3})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["detail"][0]["type"], "too_long")
+
+    def test_invalid_limits_rejected_at_startup(self):
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                create_app(max_batch=bad)
+            with self.assertRaises(ValueError):
+                MemoryCache(max_entries=bad)
+        with mock.patch.dict("os.environ", {"PART_FINDER_MAX_BATCH": "0"}), self.assertRaises(ValueError):
+            create_app()
+
     def test_batch_limit_from_env(self):
         with mock.patch.dict("os.environ", {"PART_FINDER_MAX_BATCH": "2"}):
             client = TestClient(create_app())
@@ -266,11 +282,48 @@ class UrlCacheKeyTest(unittest.TestCase):
         self.assertEqual(len(cache._store), 1)
 
 
+    def test_normalized_url_reaches_tool_and_result(self):
+        inner = mock.Mock()
+        inner.name = "inner"
+        inner.search_url.side_effect = lambda u: ([{"url": u}], None)
+        cache = MemoryCache()
+        tool = CachedTool(inner, cache)
+        res, _ = tool.search_url("https://user:pass@A.com/p?ref=evil#x")
+        self.assertEqual(res, [{"url": "https://a.com/p"}])
+        self.assertNotIn("evil", str(cache._store))
+        self.assertNotIn("pass", str(cache._store))
+
+
+class BodyCapAndRedirectTest(HostPolicyMixin, unittest.TestCase):
+    @mock.patch("parsers.requests.get")
+    def test_redirect_without_location_raises(self, get):
+        get.return_value = mock.Mock(status_code=301, headers={})
+        with self.assertRaises(FetchError):
+            _fetch("http://a.example/x")
+
+    def test_mapped_lookup_keeps_entry_on_fetch_error(self):
+        um = UrlMap(MemoryCache())
+        um.set("https://s.com", "A-1", "https://s.com/products/a")
+        out = mapped_lookup(um, "https://s.com", "A-1",
+                            mock.Mock(side_effect=FetchError("redirect without Location")), "t")
+        self.assertIsNone(out)
+        self.assertEqual(um.get("https://s.com", "A-1"), "https://s.com/products/a")
+
+    @mock.patch("tools.requests.post")
+    def test_graphql_body_capped(self, post):
+        r = _ok(b"x" * 100)
+        post.return_value = r
+        tool = ShopifyStorefrontTool("https://s.com")
+        with mock.patch("tools.MAX_BODY_BYTES", 10), self.assertRaises(FetchError):
+            tool._graphql("q", {})
+        self.assertIs(post.call_args.kwargs["stream"], True)
+
+
 class CatalogBuildTest(unittest.TestCase):
     def setUp(self):
         self.tool = ShopifyCatalogTool("https://s.com")
 
-    def test_concurrent_misses_build_once(self):
+    def test_concurrent_misses_build_once_and_fail_fast(self):
         started, release = threading.Event(), threading.Event()
         calls = []
 
@@ -280,19 +333,40 @@ class CatalogBuildTest(unittest.TestCase):
             release.wait(5)
             return [{"handle": "a", "title": "a", "variants": [{"sku": "A-1", "price": "1"}]}] if page == 1 else []
 
-        results = []
+        builder = []
         with mock.patch.object(self.tool, "_fetch_page", side_effect=fetch_page), \
                 mock.patch("tools.time.sleep"):
-            threads = [threading.Thread(target=lambda: results.append(self.tool.search("A-1"))) for _ in range(8)]
-            for t in threads:
-                t.start()
+            t = threading.Thread(target=lambda: builder.append(self.tool.search("A-1")))
+            t.start()
             started.wait(5)
+            others = [self.tool.search("A-1") for _ in range(5)]  # returns immediately
             release.set()
-            for t in threads:
-                t.join()
+            t.join()
+        self.assertTrue(all(r[0] is None and "in progress" in r[1] for r in others))
+        self.assertEqual(builder[0][0]["sku"], "A-1")
         self.assertEqual(calls, [1, 2])
-        self.assertEqual(len(results), 8)
-        self.assertTrue(all(r[0]["sku"] == "A-1" for r in results))
+
+    def test_by_handle_set_before_catalog(self):
+        with mock.patch.object(self.tool, "_fetch_page", return_value=[]), mock.patch("tools.time.sleep"):
+            order = []
+            real_setattr = type(self.tool).__setattr__
+
+            def spy(obj, name, value):
+                if name in ("_catalog", "_by_handle"):
+                    order.append(name)
+                real_setattr(obj, name, value)
+
+            with mock.patch.object(type(self.tool), "__setattr__", spy):
+                self.tool._build()
+        self.assertEqual(order, ["_by_handle", "_catalog"])
+
+    def test_fetch_error_not_retried(self):
+        with mock.patch("tools.safe_get", side_effect=FetchError("host not allowed")) as g, \
+                mock.patch("tools.time.sleep") as sleep:
+            with self.assertRaises(FetchError):
+                self.tool._fetch_page(1)
+        self.assertEqual(g.call_count, 1)
+        sleep.assert_not_called()
 
     def test_failed_build_respects_cooldown(self):
         with mock.patch.object(self.tool, "_fetch_page", side_effect=RuntimeError("boom")) as fp:
