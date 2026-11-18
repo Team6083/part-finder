@@ -18,7 +18,8 @@ from tools import (
 
 
 def _resp(status=200, payload=None, json_error=False):
-    r = mock.Mock(status_code=status)
+    r = mock.Mock(status_code=status, headers={})
+    r.iter_content.side_effect = lambda *_a, **_k: iter([b""])
     r.raise_for_status.side_effect = (
         requests.HTTPError(f"HTTP {status}") if status >= 400 else None
     )
@@ -84,6 +85,7 @@ class CatalogRetryTest(unittest.TestCase):
         self.assertIn("failed after", error)
         self.assertIsNone(self.tool._catalog)
 
+        self.tool._failed_at -= ShopifyCatalogTool.COOLDOWN  # cooldown elapsed
         get.side_effect = [_resp(200, _page("a", "A-1")), _resp(200, {"products": []})]
         result, error = self.tool.search("A-1")
         self.assertEqual(result["sku"], "A-1")

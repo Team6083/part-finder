@@ -1,14 +1,15 @@
 import logging
 import os
+import threading
 import time
 import requests
 from abc import ABC, abstractmethod
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from bs4 import BeautifulSoup
 
 from cache import ResultCache, UrlMap
 from parsers import (
-    HEADERS, NoProductError, _fetch, parse_shopify_rest, parse_json_ld,
+    HEADERS, NoProductError, _fetch, safe_get, parse_shopify_rest, parse_json_ld,
     format_price, variant_name,
 )
 
@@ -70,6 +71,12 @@ class SearchTool(ABC):
             return None, str(e)
 
 
+def normalize_url(url: str) -> str:
+    """Cache key for a URL: scheme, lowercase host and path only (no userinfo, query or fragment)."""
+    p = urlparse(url)
+    return urlunparse((p.scheme.lower(), p.netloc.rpartition("@")[2].lower(), p.path, "", "", ""))
+
+
 class CachedTool(SearchTool):
     """Decorator: wraps any SearchTool with a result cache and optional TTL."""
 
@@ -104,7 +111,7 @@ class CachedTool(SearchTool):
         return self._cached(query, lambda: self._tool.search(query))
 
     def search_url(self, url):
-        return self._cached(url, lambda: self._tool.search_url(url))
+        return self._cached(normalize_url(url), lambda: self._tool.search_url(url))
 
 
 class GenericUrlTool(SearchTool):
@@ -221,6 +228,7 @@ class ShopifyStorefrontTool(SearchTool):
             json={"query": query, "variables": variables},
             headers={**HEADERS, "Content-Type": "application/json"},
             timeout=10,
+            allow_redirects=False,
         )
         r.raise_for_status()
         body = r.json()
@@ -322,9 +330,14 @@ class ShopifyCatalogTool(SearchTool):
         self.base = store_base_url
         self._catalog: dict | None = None          # sku_upper → result dict
         self._by_handle: dict | None = None        # handle → list[result dict]
+        self._lock = threading.Lock()
+        self._failed_at: float | None = None
+        self._failure = ""
 
     PAGE_DELAY = 0.4
     MAX_ATTEMPTS = 3
+    MAX_PAGE_BYTES = 25 * 1024 * 1024
+    COOLDOWN = 300.0                               # seconds before retrying a failed build
 
     def _fetch_page(self, page):
         """Fetch one catalog page, retrying 429 / 5xx / non-JSON with exponential backoff."""
@@ -333,9 +346,9 @@ class ShopifyCatalogTool(SearchTool):
             if attempt:
                 time.sleep(2 ** attempt)
             try:
-                r = requests.get(
+                r = safe_get(
                     f"{self.base}/products.json?limit=250&page={page}",
-                    headers=HEADERS, timeout=15,
+                    max_bytes=self.MAX_PAGE_BYTES, timeout=15,
                 )
                 if r.status_code == 429 or r.status_code >= 500:
                     last_error = f"HTTP {r.status_code}"
@@ -389,8 +402,22 @@ class ShopifyCatalogTool(SearchTool):
         log.debug("%s: built catalog with %d SKUs", self.name, len(catalog))
 
     def _ensure(self):
-        if self._catalog is None:
-            self._build()
+        """Build the catalog once: concurrent callers wait on one build, and a failed build
+        is not retried until COOLDOWN has passed (callers get the same error meanwhile)."""
+        if self._catalog is not None:
+            return
+        with self._lock:
+            if self._catalog is not None:
+                return
+            if self._failed_at is not None and time.monotonic() - self._failed_at < self.COOLDOWN:
+                raise RuntimeError(f"catalog build failed recently; not retrying yet ({self._failure})")
+            try:
+                self._build()
+            except Exception as e:
+                self._failed_at = time.monotonic()
+                self._failure = str(e)
+                raise
+            self._failed_at = None
 
     def search(self, sku):
         try:

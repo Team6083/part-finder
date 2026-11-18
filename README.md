@@ -74,7 +74,7 @@ There are two cache layers over the same backend:
 
 When the result cache expires, a URL map hit goes straight to the product page and
 skips the search. If that page 404s or no longer has the SKU, the entry is dropped
-and the search runs again. `serve` caches in memory by default (per process, never evicted);
+and the search runs again. `serve` caches in memory by default (per process, bounded, least recently used evicted);
 pass `--no-cache` to turn caching off. A `--cache-file` is safe for one process at a time:
 two processes sharing a file can overwrite each other's entries.
 
@@ -128,6 +128,20 @@ Content-Type: application/json
 
 **Interactive docs** — `http://localhost:8000/docs`
 
+### Hardening for public deployment
+
+| Setting | Effect |
+|---|---|
+| `PART_FINDER_API_KEY` | If set, every `/lookup` call must send `X-API-Key: <value>` (constant-time compare), else 401. Unset = no auth. |
+| `PART_FINDER_MAX_BATCH` | Max queries per `POST /lookup` (default 50); more returns 422. |
+| `PART_FINDER_CACHE_MAX_ENTRIES` | Max entries in the in-memory cache, evicted least recently used (default 10000). |
+
+Queries are limited to 2048 characters. Only the store hosts from `rules.py` are fetched
+(redirects are followed manually, at most 5 hops, each checked against that list) and responses are
+capped at 5 MB. Error messages to clients are fixed strings (`not found`, `unsupported input`,
+`upstream error`); details go to the server log. The Docker image runs as a non-root user.
+`/docs` is not protected by the API key.
+
 ### Response
 
 ```json
@@ -157,7 +171,8 @@ Content-Type: application/json
 | `XXXX-XXXX-XXXX` | [goBILDA](https://www.gobilda.com) | BigCommerce search + JSON-LD |
 
 Direct URLs from any supported store are also accepted.
-Unknown URLs fall back to auto-detection (Shopify REST or JSON-LD).
+On the CLI, unknown URLs fall back to auto-detection (Shopify REST or JSON-LD). `serve` never
+fetches hosts that no rule names: unknown URLs and unmatched inputs return an error.
 
 ---
 
@@ -168,18 +183,22 @@ Edit `rules.py` and add a `Rule` to `build_rules()`.
 ```python
 # Shopify — SKU is the URL handle (like WCP)
 Rule(w(ShopifyHandleTool("https://example.com")),
-     sku(r"^ex-\d+$"), domain(r"example\.com"))
+     sku(r"^ex-\d+$"), domain("example.com"))
 
 # Shopify — SKU is not the handle, needs catalog scan (like AndyMark)
 Rule(w(ShopifyCatalogTool("https://example.com")),
-     sku(r"^ex-\d+"), domain(r"example\.com"))
+     sku(r"^ex-\d+"), domain("example.com"))
 
 # BigCommerce — search-based (like goBILDA)
 Rule(w(BigCommerceSearchTool("https://example.com")),
-     sku(r"^\d{4}-\d{4}$"), domain(r"example\.com"))
+     sku(r"^\d{4}-\d{4}$"), domain("example.com"))
 ```
 
-A `Rule` accepts any number of `sku(pattern)` and `domain(pattern)` conditions.
+A `Rule` accepts any number of `sku(pattern)` (regex) and `domain(host, ...)` conditions.
+`domain()` takes plain hostnames and matches a URL whose hostname is exactly that host or a
+subdomain of it (`example.com` matches `www.example.com`, not `notexample.com` or
+`evil.com/?x=example.com`). In `serve` mode these hosts are also the only hosts the server will
+fetch, including redirect targets, so a new store needs no other allowlist change.
 When a cache is active (`--cache-file`, or always for `serve` unless `--no-cache`), all rules are
 automatically wrapped with `CachedTool`.
 
