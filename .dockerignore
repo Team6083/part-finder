@@ -1,0 +1,14 @@
+.venv
+.git
+.github
+poc/
+tests/
+scripts/
+__pycache__/
+*.pyc
+*.md
+*.json
+*.tmp
+.pytest_cache/
+.dockerignore
+Dockerfile
