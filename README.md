@@ -114,17 +114,19 @@ python main.py serve --host 127.0.0.1 --port 8080 --cache-file cache.json
 
 **Single lookup**
 ```
-GET /lookup?q=WCP-1838
-GET /lookup?q=https://www.revrobotics.com/rev-11-2159/
+GET /api/v1/lookup?q=WCP-1838
+GET /api/v1/lookup?q=https://www.revrobotics.com/rev-11-2159/
 ```
 
 **Batch lookup**
 ```
-POST /lookup
+POST /api/v1/lookup
 Content-Type: application/json
 
 {"queries": ["WCP-1838", "am-0255_15T", "REV-11-2159"]}
 ```
+
+The unversioned `/lookup` paths still work for existing callers but are deprecated.
 
 **Interactive docs** — `http://localhost:8000/docs`
 
@@ -132,8 +134,8 @@ Content-Type: application/json
 
 | Setting | Effect |
 |---|---|
-| `PART_FINDER_API_KEY` | If set, every `/lookup` call must send `X-API-Key: <value>` (constant-time compare), else 401. Unset = no auth. |
-| `PART_FINDER_MAX_BATCH` | Max queries per `POST /lookup` (default 50); more returns 422. |
+| `PART_FINDER_API_KEY` | If set, every lookup call must send `X-API-Key: <value>` (constant-time compare), else 401. Unset = no auth. |
+| `PART_FINDER_MAX_BATCH` | Max queries per batch lookup (default 50); more returns 422. |
 | `PART_FINDER_CACHE_MAX_ENTRIES` | Max entries in the in-memory cache, evicted least recently used (default 10000). |
 
 Queries are limited to 2048 characters. Only the store hosts from `rules.py` are fetched

@@ -50,10 +50,10 @@ class ServerSsrfTest(HostPolicyMixin, unittest.TestCase):
     def test_ssrf_urls_rejected_without_network(self):
         with mock.patch("requests.get") as get, mock.patch("requests.post") as post:
             for url in SSRF_URLS:
-                body = self.client.get("/lookup", params={"q": url}).json()
+                body = self.client.get("/api/v1/lookup", params={"q": url}).json()
                 self.assertEqual(body[0]["status"], "error", url)
                 self.assertEqual(body[0]["error"], "unsupported input", url)
-            batch = self.client.post("/lookup", json={"queries": SSRF_URLS + ["nonsense"]}).json()
+            batch = self.client.post("/api/v1/lookup", json={"queries": SSRF_URLS + ["nonsense"]}).json()
             self.assertTrue(all(b["status"] == "error" for b in batch))
         get.assert_not_called()
         post.assert_not_called()
@@ -143,38 +143,48 @@ class FetchTest(HostPolicyMixin, unittest.TestCase):
 class ServerLimitsTest(HostPolicyMixin, unittest.TestCase):
     def test_batch_limit(self):
         client = TestClient(create_app(max_batch=3))
-        self.assertEqual(client.post("/lookup", json={"queries": ["nope"] * 3}).status_code, 200)
-        self.assertEqual(client.post("/lookup", json={"queries": ["nope"] * 4}).status_code, 422)
+        self.assertEqual(client.post("/api/v1/lookup", json={"queries": ["nope"] * 3}).status_code, 200)
+        self.assertEqual(client.post("/api/v1/lookup", json={"queries": ["nope"] * 4}).status_code, 422)
 
     def test_batch_limit_from_env(self):
         with mock.patch.dict("os.environ", {"PART_FINDER_MAX_BATCH": "2"}):
             client = TestClient(create_app())
-        self.assertEqual(client.post("/lookup", json={"queries": ["a"] * 3}).status_code, 422)
+        self.assertEqual(client.post("/api/v1/lookup", json={"queries": ["a"] * 3}).status_code, 422)
 
     def test_query_length_capped(self):
         client = TestClient(create_app())
-        self.assertEqual(client.get("/lookup", params={"q": "a" * 2049}).status_code, 422)
-        self.assertEqual(client.post("/lookup", json={"queries": ["a" * 2049]}).status_code, 422)
+        self.assertEqual(client.get("/api/v1/lookup", params={"q": "a" * 2049}).status_code, 422)
+        self.assertEqual(client.post("/api/v1/lookup", json={"queries": ["a" * 2049]}).status_code, 422)
 
     def test_api_key_enforced_when_set(self):
         client = TestClient(create_app(api_key="s3cret"))
-        self.assertEqual(client.get("/lookup", params={"q": "x"}).status_code, 401)
-        self.assertEqual(client.get("/lookup", params={"q": "x"}, headers={"X-API-Key": "bad"}).status_code, 401)
-        self.assertEqual(client.post("/lookup", json={"queries": ["x"]}).status_code, 401)
-        self.assertEqual(client.get("/lookup", params={"q": "x"}, headers={"X-API-Key": "s3cret"}).status_code, 200)
-        self.assertEqual(client.post("/lookup", json={"queries": ["x"]},
+        self.assertEqual(client.get("/api/v1/lookup", params={"q": "x"}).status_code, 401)
+        self.assertEqual(client.get("/api/v1/lookup", params={"q": "x"}, headers={"X-API-Key": "bad"}).status_code, 401)
+        self.assertEqual(client.post("/api/v1/lookup", json={"queries": ["x"]}).status_code, 401)
+        self.assertEqual(client.get("/api/v1/lookup", params={"q": "x"}, headers={"X-API-Key": "s3cret"}).status_code, 200)
+        self.assertEqual(client.post("/api/v1/lookup", json={"queries": ["x"]},
                                      headers={"X-API-Key": "s3cret"}).status_code, 200)
 
     def test_api_key_from_env(self):
         with mock.patch.dict("os.environ", {"PART_FINDER_API_KEY": "k"}):
             client = TestClient(create_app())
-        self.assertEqual(client.get("/lookup", params={"q": "x"}).status_code, 401)
+        self.assertEqual(client.get("/api/v1/lookup", params={"q": "x"}).status_code, 401)
 
     def test_no_auth_when_unset(self):
         with mock.patch.dict("os.environ", clear=False) as env:
             env.pop("PART_FINDER_API_KEY", None)
             client = TestClient(create_app())
-        self.assertEqual(client.get("/lookup", params={"q": "x"}).status_code, 200)
+        self.assertEqual(client.get("/api/v1/lookup", params={"q": "x"}).status_code, 200)
+
+    def test_legacy_path_kept_with_same_guards(self):
+        client = TestClient(create_app(api_key="s3cret", max_batch=2))
+        key = {"X-API-Key": "s3cret"}
+        self.assertEqual(client.get("/lookup", params={"q": "x"}).status_code, 401)
+        self.assertEqual(client.get("/lookup", params={"q": "x"}, headers=key).status_code, 200)
+        self.assertEqual(client.post("/lookup", json={"queries": ["x"] * 3}, headers=key).status_code, 422)
+        paths = client.get("/openapi.json").json()["paths"]
+        self.assertTrue(paths["/lookup"]["get"].get("deprecated"))
+        self.assertFalse(paths["/api/v1/lookup"]["get"].get("deprecated", False))
 
 
 class ServerErrorTextTest(HostPolicyMixin, unittest.TestCase):
@@ -184,7 +194,7 @@ class ServerErrorTextTest(HostPolicyMixin, unittest.TestCase):
     @mock.patch("parsers.requests.get")
     def test_upstream_exception_text_hidden(self, get):
         get.side_effect = requests.ConnectionError("HTTPConnectionPool(host='db.internal', port=6379)")
-        body = self.client.get("/lookup", params={"q": "REV-11-2159"}).json()
+        body = self.client.get("/api/v1/lookup", params={"q": "REV-11-2159"}).json()
         self.assertEqual(body[0]["error"], "upstream error")
         self.assertNotIn("internal", str(body))
         self.assertNotIn("6379", str(body))
@@ -192,7 +202,7 @@ class ServerErrorTextTest(HostPolicyMixin, unittest.TestCase):
     @mock.patch("parsers.requests.get")
     def test_blocked_redirect_text_hidden(self, get):
         get.return_value = _redirect("http://10.1.2.3:9999/")
-        body = self.client.get("/lookup", params={"q": "REV-11-2159"}).json()
+        body = self.client.get("/api/v1/lookup", params={"q": "REV-11-2159"}).json()
         self.assertEqual(body[0]["error"], "upstream error")
         self.assertNotIn("10.1.2.3", str(body))
 
@@ -202,12 +212,12 @@ class ServerErrorTextTest(HostPolicyMixin, unittest.TestCase):
         r.status_code = 404
         r.raise_for_status.side_effect = requests.HTTPError("404 Client Error: Not Found for url: http://x")
         get.return_value = r
-        body = self.client.get("/lookup", params={"q": "REV-11-2159"}).json()
+        body = self.client.get("/api/v1/lookup", params={"q": "REV-11-2159"}).json()
         self.assertEqual(body[0]["error"], "not found")
 
     def test_unexpected_exception_hidden(self):
         with mock.patch("server.resolve", side_effect=RuntimeError("secret detail")):
-            body = self.client.get("/lookup", params={"q": "WCP-1"}).json()
+            body = self.client.get("/api/v1/lookup", params={"q": "WCP-1"}).json()
         self.assertEqual(body[0]["error"], "upstream error")
 
 

@@ -4,7 +4,7 @@ import hmac
 import logging
 import os
 from typing import Annotated, List
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, StringConstraints
 
 from cache import ResultCache
@@ -75,16 +75,22 @@ def create_app(cache: ResultCache | None = None, ttl: float | None = None,
             return [{"status": "ok", **r} for r in result]
         return [{"status": "ok", **result}]
 
-    @app.get("/lookup", response_model=List[LookupResult], dependencies=[Depends(require_key)])
+    router = APIRouter(dependencies=[Depends(require_key)])
+
+    @router.get("/lookup", response_model=List[LookupResult])
     def lookup(q: str = Query(..., max_length=MAX_QUERY_LEN, description="SKU or product URL")):
         """Look up a part by SKU or URL. Returns all variants if a URL is given."""
         return _lookup(q)
 
-    @app.post("/lookup", response_model=List[LookupResult], dependencies=[Depends(require_key)])
+    @router.post("/lookup", response_model=List[LookupResult])
     def lookup_batch(req: BatchRequest):
         """Look up multiple parts. Results are flattened into a single list."""
         if len(req.queries) > max_batch:
             raise HTTPException(status_code=422, detail=f"too many queries (max {max_batch})")
         return [item for q in req.queries for item in _lookup(q)]
+
+    app.include_router(router, prefix="/api/v1")
+    # Unversioned paths kept for existing callers.
+    app.include_router(router, deprecated=True)
 
     return app

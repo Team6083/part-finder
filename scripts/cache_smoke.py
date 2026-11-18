@@ -60,7 +60,7 @@ def classify(log: str) -> str:
 
 
 def query(port: int, sku: str) -> list:
-    url = f"http://127.0.0.1:{port}/lookup?" + urllib.parse.urlencode({"q": sku})
+    url = f"http://127.0.0.1:{port}/api/v1/lookup?" + urllib.parse.urlencode({"q": sku})
     with urllib.request.urlopen(url, timeout=120) as r:
         return json.load(r)
 
