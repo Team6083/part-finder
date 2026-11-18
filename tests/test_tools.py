@@ -227,6 +227,178 @@ class BigCommerceUrlMapTest(unittest.TestCase):
         self.assertEqual(r["sku"], "1000-0001-0001")
 
 
+class BigCommerceVariantTest(unittest.TestCase):
+    """REV-style pages: JSON-LD is a price range, variants live in product options."""
+
+    PAGE = ('<h1>Couplers</h1><input name="product_id" value="820">'
+            '<label data-product-attribute-value="1916" for="attribute_radio_422_1916">Kit (REV-21-2108)</label>'
+            '<script type="application/ld+json">{"@type":"Product","name":"Couplers","sku":820,'
+            '"offers":{"price":"8.75","url":"u"}}</script>')
+    SEARCH = '<li class="product"><article class="card"><figure class="card-figure"><a href="https://r.com/c/?q=1">c</a></figure></article></li>'
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_variant_sku_resolved_via_options(self, fetch, post):
+        fetch.side_effect = [mock.Mock(text=self.SEARCH), mock.Mock(text=self.PAGE)]
+        post.return_value = _resp(200, {"data": {"sku": "REV-21-2108", "instock": True,
+                                                 "price": {"without_tax": {"value": 8.75}}}})
+        r, e = BigCommerceSearchTool("https://r.com").search("REV-21-2108")
+        self.assertIsNone(e)
+        self.assertEqual((r["sku"], r["price"], r["in_stock"], r["url"]),
+                         ("REV-21-2108", "8.75", True, "https://r.com/c/"))
+        self.assertEqual(post.call_args.kwargs["data"]["attribute[422]"], "1916")
+
+
+class BigCommerceVariantEdgeTest(unittest.TestCase):
+    URL = "https://r.com/c/"
+
+    @staticmethod
+    def _page(*labels):
+        radios = "".join(f'<label data-product-attribute-value="{i}" for="attribute_radio_9_{i}">{l}</label>'
+                         for i, l in enumerate(labels, 1))
+        return ('<h1>Shafts</h1><input name="product_id" value="675">' + radios +
+                '<script type="application/ld+json">{"@type":"Product","name":"Shafts","sku":675,'
+                '"offers":{"price":"5","url":"u"}}</script>')
+
+    @staticmethod
+    def _api(sku, price=5):
+        return _resp(200, {"data": {"sku": sku, "instock": True, "price": {"without_tax": {"value": price}}}})
+
+    def _tool(self):
+        return BigCommerceSearchTool("https://r.com")
+
+    @mock.patch("tools.requests.post")
+    def test_sku_first_label(self, post):
+        post.return_value = self._api("REV-21-2809")
+        page = self._page("(REV-21-2809) 1/2in Rounded Hex Shaft - 1.0in")
+        self.assertEqual(self._tool()._variants(self.URL, page, "REV-21-2809")[0]["sku"], "REV-21-2809")
+
+    @mock.patch("tools.requests.post")
+    def test_multipack_label_matches_base_sku_only_without_exact(self, post):
+        post.side_effect = [self._api("REV-21-2003-PK10"), self._api("REV-21-2003-PK50")]
+        page = self._page("(REV-21-2003-PK10) Spacer - 10 Pack", "(REV-21-2003-PK50) Spacer - 50 Pack")
+        v = self._tool()._variants(self.URL, page, "REV-21-2003")
+        self.assertEqual(len(v), 2)
+        self.assertEqual(post.call_count, 2)
+
+    @mock.patch("tools.requests.post")
+    def test_empty_api_answers_are_not_variants(self, post):
+        page = self._page("Kit (REV-21-2108)")
+        for body in ({"data": {"sku": None, "instock": True, "price": {"without_tax": {"value": 8}}}},
+                     {"data": []},
+                     {"data": {"sku": "OTHER-1", "instock": True}}):
+            post.return_value = _resp(200, body)
+            self.assertEqual(self._tool()._variants(self.URL, page, "REV-21-2108"), [])
+
+    @mock.patch("tools.requests.post")
+    def test_labels_without_sku_are_not_queried(self, post):
+        self._tool()._variants(self.URL, self._page("Plain option"))
+        post.assert_not_called()
+
+    @mock.patch("tools.requests.post", side_effect=requests.Timeout("slow"))
+    @mock.patch("tools._fetch")
+    def test_search_url_falls_back_to_json_ld_when_post_fails(self, fetch, post):
+        fetch.return_value = mock.Mock(text=self._page("Kit (REV-21-2108)"))
+        r, e = self._tool().search_url(self.URL)
+        self.assertIsNone(e)
+        self.assertEqual(r[0]["sku"], 675)
+
+    @mock.patch("tools.requests.post", side_effect=requests.Timeout("slow"))
+    def test_post_failure_propagates_for_sku_lookup(self, post):
+        with self.assertRaises(requests.Timeout):
+            self._tool()._variants(self.URL, self._page("Kit (REV-21-2108)"), "REV-21-2108")
+
+
+class BigCommerceDirectPageTest(unittest.TestCase):
+    ADDON = ('<h1>SPARK MAX</h1><input name="product_id" value="360">'
+             '<label data-product-attribute-value="1741" for="attribute_radio_434_1741">'
+             '(REV-11-1228-PK10) Data Port Cover - 10 Pack</label>'
+             '<script type="application/ld+json">{"@type":"Product","name":"SPARK MAX","sku":"REV-11-2158",'
+             '"offers":{"price":"100","url":"u"}}</script>')
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_search_url_ignores_addon_options_when_json_ld_has_real_sku(self, fetch, post):
+        fetch.return_value = mock.Mock(text=self.ADDON)
+        r, e = BigCommerceSearchTool("https://r.com").search_url("https://r.com/rev-11-2158/")
+        self.assertIsNone(e)
+        self.assertEqual([v["sku"] for v in r], ["REV-11-2158"])
+        post.assert_not_called()
+        fetch.assert_called_once()
+
+    @mock.patch("tools._fetch")
+    def test_guessed_page_skips_search(self, fetch):
+        fetch.return_value = mock.Mock(text=self.ADDON)
+        tool = BigCommerceSearchTool("https://r.com", url_fn=lambda s: f"https://r.com/{s.lower()}/")
+        r, e = tool.search("REV-11-2158")
+        self.assertEqual(r["sku"], "REV-11-2158")
+        fetch.assert_called_once_with("https://r.com/rev-11-2158/")
+
+    @mock.patch("tools._fetch")
+    def test_guess_404_falls_back_to_search(self, fetch):
+        search = '<li class="product"><article class="card"><figure class="card-figure"><a href="https://r.com/p/">p</a></figure></article></li>'
+        fetch.side_effect = [_http_error(404), mock.Mock(text=search),
+                             mock.Mock(text=self.ADDON.replace("REV-11-2158", "REV-11-9999"))]
+        tool = BigCommerceSearchTool("https://r.com", url_fn=lambda s: f"https://r.com/{s.lower()}/")
+        r, e = tool.search("REV-11-9999")
+        self.assertEqual(r["url"], "u")
+        self.assertEqual(fetch.call_count, 3)
+
+
+class BigCommerceReviewFollowUpTest(unittest.TestCase):
+    URL = "https://r.com/p/"
+
+    @staticmethod
+    def _page(ld_sku, *labels):
+        radios = "".join(f'<label data-product-attribute-value="{i}" for="attribute_radio_9_{i}">{l}</label>'
+                         for i, l in enumerate(labels, 1))
+        sku = f'"sku":"{ld_sku}",' if ld_sku is not None else ""
+        return ('<h1>P</h1><input name="product_id" value="7">' + radios +
+                '<script type="application/ld+json">{"@type":"Product","name":"P",' + sku +
+                '"offers":{"price":"5","url":"u"}}</script>')
+
+    @staticmethod
+    def _api(sku):
+        return _resp(200, {"data": {"sku": sku, "instock": True, "price": {"without_tax": {"value": 5}}}})
+
+    def _tool(self):
+        return BigCommerceSearchTool("https://r.com")
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_json_ld_sku_that_is_an_option_means_variants(self, fetch, post):
+        # JSON-LD only shows the default variant (REV /1in-extrusion/): list every option.
+        fetch.return_value = mock.Mock(text=self._page("REV-21-1000", "(REV-21-1000) A", "(REV-21-1404) B"))
+        post.side_effect = [self._api("REV-21-1000"), self._api("REV-21-1404")]
+        r, e = self._tool().search_url(self.URL)
+        self.assertEqual([v["sku"] for v in r], ["REV-21-1000", "REV-21-1404"])
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_missing_json_ld_sku_still_queries_options(self, fetch, post):
+        fetch.return_value = mock.Mock(text=self._page(None, "Kit (REV-21-2108)"))
+        post.return_value = self._api("REV-21-2108")
+        r, e = self._tool().search_url(self.URL)
+        self.assertEqual([v["sku"] for v in r], ["REV-21-2108"])
+
+    @mock.patch("tools._fetch")
+    def test_multipack_json_ld_sku_matches_base_sku(self, fetch):
+        fetch.return_value = mock.Mock(text=self._page("REV-11-1228-PK10"))
+        v = self._tool()._product(self.URL, "REV-11-1228")
+        self.assertEqual(v["sku"], "REV-11-1228-PK10")
+
+    @mock.patch("tools._fetch")
+    def test_other_sku_still_mismatches(self, fetch):
+        fetch.return_value = mock.Mock(text=self._page("REV-11-1228-PK10"))
+        self.assertIsNone(self._tool()._product(self.URL, "REV-11-12"))
+
+    def test_label_sku_ignores_parenthesised_words(self):
+        f = BigCommerceSearchTool._label_sku
+        self.assertEqual(f("Spacer (Non-Locking) (REV-21-1234)"), "REV-21-1234")
+        self.assertEqual(f("(REV-21-2809) Shaft"), "REV-21-2809")
+        self.assertIsNone(f("Spacer (Mid-Pack)"))
+
+
 class MappedLookupFailureTest(unittest.TestCase):
     """Only a gone product drops a mapping; transient errors and cache faults must not."""
 

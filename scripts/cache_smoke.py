@@ -34,8 +34,14 @@ SKUS = {
     "am-14U5_NGB":    ("AndyMark",  True),
     "am-3645":        ("AndyMark",  True),
     "TTB-0001":       ("ThriftyBot", True),
-    "REV-11-2159":    ("REV",       False),  # URL derived from SKU: direct page fetch
+    # REV, single products: the page is /<sku>/, fetched directly, nothing to map
+    "REV-11-2159":    ("REV",       False),
     "REV-21-1652":    ("REV",       False),
+    "REV-11-2158":    ("REV",       False),  # page also has an add-on option: must not be mistaken for a variant
+    "REV-11-1228":    ("REV",       False),  # page SKU is REV-11-1228-PK10: matched by the -PKn fallback
+    # REV, variant SKUs: /<sku>/ 404s, so search, then the option API; the URL map skips the search
+    "REV-21-2108":    ("REV",       True),   # option label ends with the SKU: "Kit (REV-21-2108)"
+    "REV-21-2809":    ("REV",       True),   # option label starts with the SKU: "(REV-21-2809) ..."
     "5000-0002-0001": ("goBILDA",   True),
     "1310-0016-4008": ("goBILDA",   True),
 }
@@ -45,7 +51,8 @@ MARKERS = [  # first match wins; order matters
     ("result-cache", "cache hit for"),
     ("url-map",      "URL map hit for"),
     ("search",       "Storefront search hit for"),
-    ("search",       "search page first hit"),
+    ("search",       "search page hit for"),
+    ("direct",       "direct page hit for"),
     ("catalog",      "catalog hit for"),
     ("direct",       ".js handle hit for"),
     ("direct",       "JSON-LD hit for"),
@@ -112,7 +119,10 @@ def main():
             time.sleep(args.ttl + 1)
             expired, expired_ms, _ = run_phase(sku)
 
-            ok_body = bool(body) and body[0].get("status") == "ok" and body[0].get("sku", "").upper() == sku.upper()
+            got = body[0].get("sku", "").upper() if body else ""
+            # A multi-pack page answers with <sku>-PKn (the tools' -PKn fallback).
+            ok_body = bool(body) and body[0].get("status") == "ok" and (
+                got == sku.upper() or got.startswith(sku.upper() + "-PK"))
             want_expired = "url-map" if has_map else None
             problems = []
             if not ok_body:
