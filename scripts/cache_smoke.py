@@ -119,7 +119,10 @@ def main():
             time.sleep(args.ttl + 1)
             expired, expired_ms, _ = run_phase(sku)
 
-            ok_body = bool(body) and body[0].get("status") == "ok" and body[0].get("sku", "").upper() == sku.upper()
+            got = body[0].get("sku", "").upper() if body else ""
+            # A multi-pack page answers with <sku>-PKn (the tools' -PKn fallback).
+            ok_body = bool(body) and body[0].get("status") == "ok" and (
+                got == sku.upper() or got.startswith(sku.upper() + "-PK"))
             want_expired = "url-map" if has_map else None
             problems = []
             if not ok_body:
