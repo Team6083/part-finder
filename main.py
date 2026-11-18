@@ -20,11 +20,11 @@ def _add_cache_args(parser):
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--cache-file", metavar="PATH",
-        help="Persist result cache to a JSON file (one process at a time per file)",
+        help="Persist the result and SKU -> URL caches to a JSON file (one process at a time per file)",
     )
     group.add_argument(
         "--no-cache", action="store_true",
-        help="Disable all caching (serve otherwise caches in memory)",
+        help="Disable all caching (serve otherwise caches in memory, per process)",
     )
     parser.add_argument(
         "--cache-ttl", type=float, default=DEFAULT_CACHE_TTL_HOURS, metavar="HOURS",
@@ -130,21 +130,27 @@ def run_serve(args):
 def main():
     parser = argparse.ArgumentParser(
         description="Look up robotics parts by SKU or URL.",
+        epilog="With no subcommand, `pipe` is assumed: `main.py --no-delay` == `main.py pipe --no-delay`. "
+               "Run `main.py pipe -h` or `main.py serve -h` for each mode's options.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
     # ── pipe (default) ──────────────────────────────
     pipe = subparsers.add_parser("pipe", help="Read SKUs/URLs from stdin (default)")
-    pipe.add_argument("--format", choices=["human", "json", "tsv"], default="human")
-    pipe.add_argument("--delay", type=float, default=1.0, metavar="SECONDS")
-    pipe.add_argument("--no-delay", action="store_true")
+    pipe.add_argument("--format", choices=["human", "json", "tsv"], default="human",
+                      help="Output format (default: human)")
+    pipe.add_argument("--delay", type=float, default=1.0, metavar="SECONDS",
+                      help="Pause between lookups (default: 1.0)")
+    pipe.add_argument("--no-delay", action="store_true", help="Do not pause between lookups")
     _add_cache_args(pipe)
     _add_verbose_arg(pipe)
 
     # ── serve ───────────────────────────────────────
     serve = subparsers.add_parser("serve", help="Start HTTP API server")
-    serve.add_argument("--host", default="0.0.0.0", metavar="HOST")
-    serve.add_argument("--port", type=int, default=8000, metavar="PORT")
+    serve.add_argument("--host", default="0.0.0.0", metavar="HOST",
+                       help="Bind address (default: 0.0.0.0, reachable from other machines; use 127.0.0.1 for local only)")
+    serve.add_argument("--port", type=int, default=8000, metavar="PORT",
+                       help="Port to listen on (default: 8000)")
     _add_cache_args(serve)
     _add_verbose_arg(serve)
 
