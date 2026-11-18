@@ -496,9 +496,11 @@ class BigCommerceSearchTool(SearchTool):
     MAX_SEARCH_CANDIDATES = 3
     MAX_VARIANTS = 24
 
-    def __init__(self, store_base_url: str, url_map: UrlMap | None = None):
+    def __init__(self, store_base_url: str, url_map: UrlMap | None = None, url_fn=None):
         self.base = store_base_url
         self._url_map = url_map
+        # Optional SKU -> product URL guess, tried before searching (REV single products: /rev-11-2159/).
+        self._url_fn = url_fn
 
     @staticmethod
     def _options(html):
@@ -609,9 +611,9 @@ class BigCommerceSearchTool(SearchTool):
             except NoProductError:
                 results = []
             _, _, options = self._options(r.text)
-            label_skus = {(self._label_sku(l) or "").upper() for _, _, l in options} - {""}
-            # JSON-LD that already lists the variants wins; otherwise ask per option.
-            if label_skus and not any(str(v["sku"]).upper() in label_skus for v in results):
+            # A bare integer SKU is BigCommerce's product id: the JSON-LD has no real SKU, so the
+            # variants are only reachable per option. A real SKU wins; options are then add-ons.
+            if options and all(str(v["sku"]).isdigit() for v in results):
                 variants = self._variants(url, r.text)
                 if variants:
                     return variants, None
@@ -626,6 +628,15 @@ class BigCommerceSearchTool(SearchTool):
                                lambda url: self._product(url, sku), self.name)
         if mapped:
             return mapped, None
+
+        if self._url_fn:
+            try:
+                match = self._product(self._url_fn(sku), sku)
+                if match:
+                    log.debug("%s: direct page hit for %s", self.name, sku)
+                    return match, None
+            except Exception as e:
+                log.debug("%s: no direct page for %s (%s); searching", self.name, sku, e)
 
         try:
             r = _fetch(f"{self.base}/search.php?search_query={sku}")

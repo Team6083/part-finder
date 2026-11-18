@@ -309,6 +309,42 @@ class BigCommerceVariantEdgeTest(unittest.TestCase):
             self._tool()._variants(self.URL, self._page("Kit (REV-21-2108)"), "REV-21-2108")
 
 
+class BigCommerceDirectPageTest(unittest.TestCase):
+    ADDON = ('<h1>SPARK MAX</h1><input name="product_id" value="360">'
+             '<label data-product-attribute-value="1741" for="attribute_radio_434_1741">'
+             '(REV-11-1228-PK10) Data Port Cover - 10 Pack</label>'
+             '<script type="application/ld+json">{"@type":"Product","name":"SPARK MAX","sku":"REV-11-2158",'
+             '"offers":{"price":"100","url":"u"}}</script>')
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_search_url_ignores_addon_options_when_json_ld_has_real_sku(self, fetch, post):
+        fetch.return_value = mock.Mock(text=self.ADDON)
+        r, e = BigCommerceSearchTool("https://r.com").search_url("https://r.com/rev-11-2158/")
+        self.assertIsNone(e)
+        self.assertEqual([v["sku"] for v in r], ["REV-11-2158"])
+        post.assert_not_called()
+        fetch.assert_called_once()
+
+    @mock.patch("tools._fetch")
+    def test_guessed_page_skips_search(self, fetch):
+        fetch.return_value = mock.Mock(text=self.ADDON)
+        tool = BigCommerceSearchTool("https://r.com", url_fn=lambda s: f"https://r.com/{s.lower()}/")
+        r, e = tool.search("REV-11-2158")
+        self.assertEqual(r["sku"], "REV-11-2158")
+        fetch.assert_called_once_with("https://r.com/rev-11-2158/")
+
+    @mock.patch("tools._fetch")
+    def test_guess_404_falls_back_to_search(self, fetch):
+        search = '<li class="product"><article class="card"><figure class="card-figure"><a href="https://r.com/p/">p</a></figure></article></li>'
+        fetch.side_effect = [_http_error(404), mock.Mock(text=search),
+                             mock.Mock(text=self.ADDON.replace("REV-11-2158", "REV-11-9999"))]
+        tool = BigCommerceSearchTool("https://r.com", url_fn=lambda s: f"https://r.com/{s.lower()}/")
+        r, e = tool.search("REV-11-9999")
+        self.assertEqual(r["url"], "u")
+        self.assertEqual(fetch.call_count, 3)
+
+
 class MappedLookupFailureTest(unittest.TestCase):
     """Only a gone product drops a mapping; transient errors and cache faults must not."""
 

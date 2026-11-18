@@ -34,10 +34,13 @@ SKUS = {
     "am-14U5_NGB":    ("AndyMark",  True),
     "am-3645":        ("AndyMark",  True),
     "TTB-0001":       ("ThriftyBot", True),
-    "REV-11-2159":    ("REV",       True),
-    "REV-21-1652":    ("REV",       True),
-    "REV-21-2108":    ("REV",       True),   # variant SKU: product page URL isn't derivable, resolved via option API
-    "REV-21-2809":    ("REV",       True),   # option label has the SKU first: "(REV-21-2809) ..."
+    # REV, single products: the page is /<sku>/, fetched directly, nothing to map
+    "REV-11-2159":    ("REV",       False),
+    "REV-21-1652":    ("REV",       False),
+    "REV-11-2158":    ("REV",       False),  # page also has an add-on option: must not be mistaken for a variant
+    # REV, variant SKUs: /<sku>/ 404s, so search, then the option API; the URL map skips the search
+    "REV-21-2108":    ("REV",       True),   # option label ends with the SKU: "Kit (REV-21-2108)"
+    "REV-21-2809":    ("REV",       True),   # option label starts with the SKU: "(REV-21-2809) ..."
     "5000-0002-0001": ("goBILDA",   True),
     "1310-0016-4008": ("goBILDA",   True),
 }
@@ -48,6 +51,7 @@ MARKERS = [  # first match wins; order matters
     ("url-map",      "URL map hit for"),
     ("search",       "Storefront search hit for"),
     ("search",       "search page hit for"),
+    ("direct",       "direct page hit for"),
     ("catalog",      "catalog hit for"),
     ("direct",       ".js handle hit for"),
     ("direct",       "JSON-LD hit for"),
