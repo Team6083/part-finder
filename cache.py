@@ -7,6 +7,7 @@ import threading
 import time
 import pathlib
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 
 log = logging.getLogger(__name__)
 
@@ -38,17 +39,32 @@ def _read_entry(entry: dict | None, ttl: float | None) -> dict | None:
 
 
 class MemoryCache(ResultCache):
-    def __init__(self):
-        self._store: dict = {}
+    """Thread-safe in-memory cache bounded to max_entries, evicting least recently used."""
+
+    def __init__(self, max_entries: int = 10_000):
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be >= 1, got {max_entries}")
+        self._max = max_entries
+        self._store: OrderedDict = OrderedDict()
+        self._lock = threading.Lock()
 
     def get(self, key, ttl=None):
-        return _read_entry(self._store.get(key), ttl)
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is not None:
+                self._store.move_to_end(key)
+        return _read_entry(entry, ttl)
 
     def set(self, key, result):
-        self._store[key] = _entry(result)
+        with self._lock:
+            self._store[key] = _entry(result)
+            self._store.move_to_end(key)
+            while len(self._store) > self._max:
+                self._store.popitem(last=False)
 
     def delete(self, key):
-        self._store.pop(key, None)
+        with self._lock:
+            self._store.pop(key, None)
 
 
 class FileCache(ResultCache):

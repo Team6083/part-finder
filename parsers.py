@@ -2,7 +2,8 @@ import json
 import requests
 from decimal import Decimal, InvalidOperation
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+from urllib3.util import parse_url
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -14,8 +15,80 @@ class NoProductError(ValueError):
     """The page loaded but holds no product data (e.g. a removed product's redirect page)."""
 
 
+MAX_BODY_BYTES = 5 * 1024 * 1024
+MAX_REDIRECTS = 5
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+_allowed_hosts: frozenset[str] | None = None
+
+
+class FetchError(ValueError):
+    """A request was refused (disallowed host or scheme, too many redirects, oversized body)."""
+
+
+def set_allowed_hosts(hosts) -> None:
+    """Restrict every fetch (and each redirect hop) to these hosts and their subdomains.
+    None lifts the restriction (CLI with generic URL fallback)."""
+    global _allowed_hosts
+    _allowed_hosts = None if hosts is None else frozenset(h.lower() for h in hosts)
+
+
+def host_matches(host: str, domains) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def url_host(url: str) -> str | None:
+    """Lowercased hostname of an http(s) URL, or None. Uses the parser requests connects with."""
+    try:
+        parsed = parse_url(url)
+    except Exception:
+        return None
+    if (parsed.scheme or "").lower() not in ("http", "https") or not parsed.host:
+        return None
+    return parsed.host.lower()
+
+
+def _check_url(url: str) -> None:
+    host = url_host(url)
+    if host is None:
+        raise FetchError("unsupported URL")
+    if _allowed_hosts is not None and not host_matches(host, _allowed_hosts):
+        raise FetchError(f"host not allowed: {host}")
+
+
+def read_capped(r, max_bytes: int) -> None:
+    length = r.headers.get("Content-Length", "")
+    if length.isdigit() and int(length) > max_bytes:
+        r.close()
+        raise FetchError("response too large")
+    body = bytearray()
+    for chunk in r.iter_content(65536):
+        body += chunk
+        if len(body) > max_bytes:
+            r.close()
+            raise FetchError("response too large")
+    r._content = bytes(body)
+
+
+def safe_get(url, max_bytes=MAX_BODY_BYTES, timeout=10):
+    """GET with manual redirects (each hop host-checked) and a response size cap. No status check."""
+    for _ in range(MAX_REDIRECTS + 1):
+        _check_url(url)
+        r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=False, stream=True)
+        if r.status_code in _REDIRECT_CODES:
+            location = r.headers.get("Location")
+            r.close()
+            if not location:
+                raise FetchError("redirect without Location")
+            url = urljoin(url, location)
+            continue
+        read_capped(r, max_bytes)
+        return r
+    raise FetchError("too many redirects")
+
+
 def _fetch(url, **kwargs):
-    r = requests.get(url, headers=HEADERS, timeout=10, **kwargs)
+    r = safe_get(url, **kwargs)
     r.raise_for_status()
     return r
 

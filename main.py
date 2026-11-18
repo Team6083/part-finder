@@ -5,6 +5,7 @@ import json
 import time
 import argparse
 import logging
+import os
 
 from cache import FileCache, MemoryCache
 from rules import build_rules, resolve
@@ -56,7 +57,7 @@ def _make_cache(args, default_memory=False):
     elif args.cache_file:
         cache = FileCache(args.cache_file)
     else:
-        cache = MemoryCache() if default_memory else None
+        cache = MemoryCache(int(os.environ.get("PART_FINDER_CACHE_MAX_ENTRIES", 10_000))) if default_memory else None
     return cache, ttl, map_ttl
 
 
