@@ -72,7 +72,7 @@ def build_rules(
              sku(r"^wcp-\d+$"),            domain("wcproducts.com")),
         Rule(w(storefront("https://www.andymark.com")),
              sku(r"^am-\d+"),              domain("andymark.com")),
-        Rule(w(JsonLdHandleTool("https://www.revrobotics.com")),
+        Rule(w(BigCommerceSearchTool("https://www.revrobotics.com", url_map=url_map)),
              sku(r"^rev-\d+-\d+"),         domain("revrobotics.com")),
         Rule(w(storefront("https://www.thethriftybot.com")),
              sku(r"^ttb-\d+"),             domain("thethriftybot.com")),

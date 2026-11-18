@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import threading
 import time
 import requests
@@ -9,7 +10,7 @@ from bs4 import BeautifulSoup
 
 from cache import ResultCache, UrlMap
 from parsers import (
-    HEADERS, MAX_BODY_BYTES, FetchError, NoProductError, _fetch, read_capped, safe_get, parse_shopify_rest, parse_json_ld,
+    HEADERS, MAX_BODY_BYTES, FetchError, _check_url, NoProductError, _fetch, read_capped, safe_get, parse_shopify_rest, parse_json_ld,
     format_price, variant_name,
 )
 
@@ -486,19 +487,113 @@ class JsonLdHandleTool(SearchTool):
 class BigCommerceSearchTool(SearchTool):
     """
     BigCommerce stores where SKU != URL handle.
-    Searches via /search.php, takes the first result, parses JSON-LD.
-    Example: goBILDA
+    Searches via /search.php, takes the first results, parses JSON-LD.
+    Pages whose JSON-LD only has a price range (variants chosen via product
+    options, e.g. REV Robotics) are resolved through the product-attributes API.
+    Example: goBILDA, REV Robotics
     """
+
+    MAX_SEARCH_CANDIDATES = 3
+    MAX_VARIANTS = 12
 
     def __init__(self, store_base_url: str, url_map: UrlMap | None = None):
         self.base = store_base_url
         self._url_map = url_map
 
+    @staticmethod
+    def _options(html):
+        """(product_id, name, [(attribute_id, value_id, label)]) for option-based variants."""
+        soup = BeautifulSoup(html, "html.parser")
+        pid = soup.select_one("input[name=product_id]")
+        h1 = soup.select_one("h1")
+        options = []
+        for label in soup.select("label[data-product-attribute-value]"):
+            m = re.match(r"attribute_\w+?_(\d+)_(\d+)$", label.get("for", ""))
+            if m:
+                options.append((m[1], m[2], label.get_text(" ", strip=True)))
+        for sel in soup.select("select[name^='attribute[']"):
+            attr = re.search(r"\[(\d+)\]", sel["name"])
+            for opt in sel.select("option[value]"):
+                if attr and opt["value"]:
+                    options.append((attr[1], opt["value"], opt.get_text(" ", strip=True)))
+        return (pid.get("value") if pid else None,
+                h1.get_text(strip=True) if h1 else "", options)
+
+    @staticmethod
+    def _label_sku(label):
+        m = re.search(r"\(([A-Za-z0-9][\w-]*)\)\s*$", label)
+        return m[1] if m else None
+
+    def _variant(self, url, pid, name, attr, value, label):
+        endpoint = f"{self.base}/remote/v1/product-attributes/{pid}"
+        _check_url(endpoint)
+        r = requests.post(endpoint, headers=HEADERS, timeout=10,
+                          data={"action": "add", "product_id": pid, "qty[]": 1,
+                                f"attribute[{attr}]": value})
+        r.raise_for_status()
+        data = r.json().get("data") or {}
+        price = ((data.get("price") or {}).get("without_tax") or {}).get("value", "")
+        in_stock = bool(data.get("instock")) and data.get("purchasable", True) is not False
+        return {
+            "name":         f"{name} - {label}" if name else label,
+            "sku":          data.get("sku") or self._label_sku(label) or "",
+            "price":        format_price(price) if price != "" else "",
+            "in_stock":     in_stock,
+            "stock_status": "in_stock" if in_stock else "out_of_stock",
+            "source":       "bigcommerce_variant",
+            "url":          url,
+        }
+
+    def _variants(self, url, html, sku=None):
+        """Variants of an option-based product page; only the one matching sku if given."""
+        pid, name, options = self._options(html)
+        if not pid:
+            return []
+        out = []
+        for attr, value, label in options:
+            if sku and (self._label_sku(label) or "").upper() != sku.upper():
+                continue
+            if len(out) >= self.MAX_VARIANTS:
+                break
+            out.append(self._variant(url, pid, name, attr, value, label))
+        return out
+
     def _product(self, product_url, sku):
         """Fetch a product page and return the variant matching sku, or None."""
         r = _fetch(product_url)
-        results = parse_json_ld(product_url, r.text)
-        return next((v for v in results if v["sku"].upper() == sku.upper()), None)
+        try:
+            results = parse_json_ld(product_url, r.text)
+        except NoProductError:
+            results = []
+        match = next((v for v in results if str(v["sku"]).upper() == sku.upper()), None)
+        if match:
+            return match
+        variants = self._variants(product_url, r.text, sku)
+        if variants:
+            return variants[0]
+        if not results:
+            raise NoProductError("No JSON-LD Product found")
+        return None
+
+    def search_url(self, url):
+        try:
+            r = _fetch(url)
+            try:
+                results = parse_json_ld(url, r.text)
+            except NoProductError:
+                results = []
+            _, _, options = self._options(r.text)
+            label_skus = {(self._label_sku(l) or "").upper() for _, _, l in options} - {""}
+            # JSON-LD that already lists the variants wins; otherwise ask per option.
+            if label_skus and not any(str(v["sku"]).upper() in label_skus for v in results):
+                variants = self._variants(url, r.text)
+                if variants:
+                    return variants, None
+            if not results:
+                raise NoProductError("No JSON-LD Product found")
+            return results, None
+        except Exception as e:
+            return None, str(e)
 
     def search(self, sku):
         mapped = mapped_lookup(self._url_map, self.base, sku,
@@ -511,19 +606,28 @@ class BigCommerceSearchTool(SearchTool):
         except Exception as e:
             return None, str(e)
 
-        card = BeautifulSoup(r.text, "html.parser").select_one("li.product a.card")
-        if not card:
+        # goBILDA links the card itself; REV links the figure inside it.
+        cards = BeautifulSoup(r.text, "html.parser").select("li.product a.card, li.product .card-figure a[href]")
+        if not cards:
             return None, f"SKU {sku} not found on {self.base}"
 
-        product_url = card["href"].split("?")[0]
-        log.debug("%s: search page first hit %s", self.name, product_url)
-        try:
-            match = self._product(product_url, sku)
-            if not match:
-                return None, f"SKU mismatch: {sku} not found in search results"
-            log.debug("%s: JSON-LD hit for %s", self.name, sku)
-            if self._url_map:
-                self._url_map.set(self.base, sku, product_url)
-            return match, None
-        except Exception as e:
-            return None, str(e)
+        seen = []
+        for card in cards:
+            product_url = card["href"].split("?")[0]
+            if product_url not in seen:
+                seen.append(product_url)
+        err, checked = None, False
+        for product_url in seen[:self.MAX_SEARCH_CANDIDATES]:
+            log.debug("%s: search page candidate %s", self.name, product_url)
+            try:
+                match = self._product(product_url, sku)
+            except Exception as e:
+                err = str(e)
+                continue
+            checked = True
+            if match:
+                log.debug("%s: search page hit for %s", self.name, sku)
+                if self._url_map:
+                    self._url_map.set(self.base, sku, product_url)
+                return match, None
+        return None, (None if checked else err) or f"SKU mismatch: {sku} not found in search results"

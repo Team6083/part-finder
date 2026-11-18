@@ -227,6 +227,28 @@ class BigCommerceUrlMapTest(unittest.TestCase):
         self.assertEqual(r["sku"], "1000-0001-0001")
 
 
+class BigCommerceVariantTest(unittest.TestCase):
+    """REV-style pages: JSON-LD is a price range, variants live in product options."""
+
+    PAGE = ('<h1>Couplers</h1><input name="product_id" value="820">'
+            '<label data-product-attribute-value="1916" for="attribute_radio_422_1916">Kit (REV-21-2108)</label>'
+            '<script type="application/ld+json">{"@type":"Product","name":"Couplers","sku":820,'
+            '"offers":{"price":"8.75","url":"u"}}</script>')
+    SEARCH = '<li class="product"><article class="card"><figure class="card-figure"><a href="https://r.com/c/?q=1">c</a></figure></article></li>'
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_variant_sku_resolved_via_options(self, fetch, post):
+        fetch.side_effect = [mock.Mock(text=self.SEARCH), mock.Mock(text=self.PAGE)]
+        post.return_value = _resp(200, {"data": {"sku": "REV-21-2108", "instock": True,
+                                                 "price": {"without_tax": {"value": 8.75}}}})
+        r, e = BigCommerceSearchTool("https://r.com").search("REV-21-2108")
+        self.assertIsNone(e)
+        self.assertEqual((r["sku"], r["price"], r["in_stock"], r["url"]),
+                         ("REV-21-2108", "8.75", True, "https://r.com/c/"))
+        self.assertEqual(post.call_args.kwargs["data"]["attribute[422]"], "1916")
+
+
 class MappedLookupFailureTest(unittest.TestCase):
     """Only a gone product drops a mapping; transient errors and cache faults must not."""
 
