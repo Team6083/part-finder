@@ -82,6 +82,19 @@ For AndyMark and ThriftyBot, lookups use Storefront API search. Only when that f
 no exact SKU match does the first query fall back to fetching the full product
 catalog (kept in memory for the rest of the session).
 
+### Checking the cache against live stores
+
+`scripts/cache_smoke.py` starts `serve -v`, queries each SKU three times (cold, immediately
+again, after the result TTL expires) and reports from the server log which path served each one:
+a fresh fetch, a result-cache hit, or a URL-map hit. It calls the real store sites, so it is a manual
+check and is not run by CI or included in the Docker image.
+
+```bash
+python scripts/cache_smoke.py                  # default SKUs across all stores
+python scripts/cache_smoke.py WCP-1810 am-3645 # only these
+python scripts/cache_smoke.py --slow           # also an AndyMark SKU that forces the catalog crawl
+```
+
 ---
 
 ## HTTP server
