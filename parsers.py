@@ -10,6 +10,10 @@ HEADERS = {
 }
 
 
+class NoProductError(ValueError):
+    """The page loaded but holds no product data (e.g. a removed product's redirect page)."""
+
+
 def _fetch(url, **kwargs):
     r = requests.get(url, headers=HEADERS, timeout=10, **kwargs)
     r.raise_for_status()
@@ -53,7 +57,7 @@ def parse_shopify_rest(url) -> list[dict]:
     product = _fetch(f"{clean}.js").json()
     variants = product.get("variants", [])
     if not variants:
-        raise ValueError("No variants found")
+        raise NoProductError("No variants found")
     title = product.get("title", "")
     results = []
     for v in variants:
@@ -114,4 +118,4 @@ def parse_json_ld(url, html) -> list[dict]:
                     return results
         except json.JSONDecodeError:
             continue
-    raise ValueError("No JSON-LD Product found")
+    raise NoProductError("No JSON-LD Product found")

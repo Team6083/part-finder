@@ -16,9 +16,14 @@ DEFAULT_MAP_TTL_HOURS = 24 * 7
 
 
 def _add_cache_args(parser):
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--cache-file", metavar="PATH",
-        help="Persist result cache to a JSON file",
+        help="Persist result cache to a JSON file (one process at a time per file)",
+    )
+    group.add_argument(
+        "--no-cache", action="store_true",
+        help="Disable all caching (serve otherwise caches in memory)",
     )
     parser.add_argument(
         "--cache-ttl", type=float, default=DEFAULT_CACHE_TTL_HOURS, metavar="HOURS",
@@ -46,7 +51,9 @@ def _setup_logging(verbose):
 def _make_cache(args, default_memory=False):
     ttl = None if args.cache_ttl == 0 else args.cache_ttl * 3600
     map_ttl = None if args.map_ttl == 0 else args.map_ttl * 3600
-    if args.cache_file:
+    if args.no_cache:
+        cache = None
+    elif args.cache_file:
         cache = FileCache(args.cache_file)
     else:
         cache = MemoryCache() if default_memory else None

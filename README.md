@@ -74,7 +74,9 @@ There are two cache layers over the same backend:
 
 When the result cache expires, a URL map hit goes straight to the product page and
 skips the search. If that page 404s or no longer has the SKU, the entry is dropped
-and the search runs again. `serve` always caches (in memory without `--cache-file`).
+and the search runs again. `serve` caches in memory by default (per process, never evicted);
+pass `--no-cache` to turn caching off. A `--cache-file` is safe for one process at a time:
+two processes sharing a file can overwrite each other's entries.
 
 For AndyMark and ThriftyBot, lookups use Storefront API search. Only when that finds
 no exact SKU match does the first query fall back to fetching the full product
@@ -165,7 +167,8 @@ Rule(w(BigCommerceSearchTool("https://example.com")),
 ```
 
 A `Rule` accepts any number of `sku(pattern)` and `domain(pattern)` conditions.
-When `--cache-file` is set, all rules are automatically wrapped with `CachedTool`.
+When a cache is active (`--cache-file`, or always for `serve` unless `--no-cache`), all rules are
+automatically wrapped with `CachedTool`.
 
 ---
 

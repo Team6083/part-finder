@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 
 from cache import ResultCache, UrlMap
 from parsers import (
-    HEADERS, _fetch, parse_shopify_rest, parse_json_ld,
+    HEADERS, NoProductError, _fetch, parse_shopify_rest, parse_json_ld,
     format_price, variant_name,
 )
 
@@ -22,8 +22,9 @@ def mapped_lookup(url_map: UrlMap | None, base: str, sku: str, fetch_match, name
 
     ``fetch_match(url)`` returns the matching variant dict or None (page loads but has
     no such SKU). The entry is dropped only when the product is really gone: a
-    404/410, or a page without the SKU. Timeouts, 429s and 5xx keep it, since
-    those say nothing about the mapping. Returns the variant, or None to search.
+    404/410, a page with no product data, or a page without the SKU. Timeouts,
+    429s and 5xx keep it, since those say nothing about the mapping. Returns the
+    variant, or None to search.
     """
     url = url_map.get(base, sku) if url_map else None
     if not url:
@@ -35,6 +36,8 @@ def mapped_lookup(url_map: UrlMap | None, base: str, sku: str, fetch_match, name
         if status not in (404, 410):
             log.debug("%s: mapped URL %s transient failure for %s (%s); keeping entry", name, url, sku, e)
             return None
+    except NoProductError:
+        pass
     except Exception as e:
         log.debug("%s: mapped URL %s transient failure for %s (%s); keeping entry", name, url, sku, e)
         return None
@@ -269,7 +272,9 @@ class ShopifyStorefrontTool(SearchTool):
         def fetch_match(url):
             return next((v for v in parse_shopify_rest(url)
                          if v["sku"].upper() == sku.upper()), None)
-        return mapped_lookup(self._url_map, self.base, sku, fetch_match, self.name)
+        match = mapped_lookup(self._url_map, self.base, sku, fetch_match, self.name)
+        # Same source as a fresh search, so output doesn't change when the result cache expires.
+        return {**match, "source": "shopify_storefront"} if match else None
 
     def search(self, sku):
         mapped = self._from_mapped_url(sku)

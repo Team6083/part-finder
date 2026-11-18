@@ -3,7 +3,14 @@ from unittest import mock
 
 import requests
 
+import argparse
+import os
+import stat
+import tempfile
+
+import main
 from cache import MemoryCache, FileCache, UrlMap
+from rules import build_rules
 from parsers import format_cents, parse_shopify_rest
 from tools import (
     CachedTool, ShopifyCatalogTool, ShopifyStorefrontTool, BigCommerceSearchTool,
@@ -315,6 +322,122 @@ class FileCacheRobustnessTest(unittest.TestCase):
         c.set("a", {"x": 1})
         c.delete("a")
         self.assertEqual(os.listdir(self.dir.name), ["c.json"])
+
+
+class FileCachePermissionTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "c.json")
+
+    def test_unreadable_file_is_not_wiped(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file permissions")
+        c = FileCache(self.path)
+        c.set("a", {"x": 1})
+        os.chmod(self.path, 0)
+        self.addCleanup(os.chmod, self.path, 0o644)
+        with self.assertRaises(OSError):
+            c.set("b", {"x": 2})
+        os.chmod(self.path, 0o644)
+        self.assertEqual(c.get("a", None), {"x": 1})
+
+    def test_mode_is_preserved(self):
+        c = FileCache(self.path)
+        c.set("a", {"x": 1})
+        os.chmod(self.path, 0o640)
+        c.set("b", {"x": 2})
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o640)
+
+    def test_new_file_is_world_readable(self):
+        FileCache(self.path).set("a", {"x": 1})
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o644)
+
+
+class StaleOnEmptyPageTest(unittest.TestCase):
+    @mock.patch("tools._fetch")
+    def test_goBILDA_200_without_json_ld_drops_mapping(self, fetch):
+        m = UrlMap(MemoryCache(), ttl=None)
+        m.set("https://g.com", "1000-0001-0001", "https://g.com/gone/")
+        fetch.side_effect = [mock.Mock(text="<html>moved</html>"), mock.Mock(text="")]
+        BigCommerceSearchTool("https://g.com", url_map=m).search("1000-0001-0001")
+        self.assertIsNone(m.get("https://g.com", "1000-0001-0001"))
+
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_shopify_non_json_page_keeps_mapping(self, post, fetch):
+        m = UrlMap(MemoryCache(), ttl=None)
+        m.set("https://s.com", "AM-2", "https://s.com/products/h")
+        fetch.return_value.json.side_effect = requests.exceptions.JSONDecodeError("x", "", 0)
+        post.return_value = _resp(200, {"data": {"search": {"nodes": []}}})
+        ShopifyStorefrontTool("https://s.com", url_map=m).search("AM-2")
+        self.assertIsNotNone(m.get("https://s.com", "AM-2"))
+
+
+class MappedResultConsistencyTest(unittest.TestCase):
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_mapped_result_equals_searched_result(self, post, fetch):
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [{
+            "handle": "h", "title": "T", "variants": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"sku": "AM-2", "title": "Default Title",
+                           "availableForSale": True, "price": {"amount": "167.0"}}]}}]}}})
+        fetch.return_value.json.return_value = {"title": "T", "variants": [
+            {"sku": "AM-2", "title": "Default Title", "price": 16700, "available": True}]}
+        tool = ShopifyStorefrontTool("https://s.com", url_map=UrlMap(MemoryCache(), ttl=None))
+        searched, _ = tool.search("AM-2")
+        mapped, _ = tool.search("AM-2")
+        self.assertEqual(fetch.call_count, 1)  # second call really used the map
+        self.assertEqual(mapped, searched)
+
+
+class WcpFallbackMapTest(unittest.TestCase):
+    @mock.patch("parsers._fetch")
+    @mock.patch("tools.requests.post")
+    def test_wcp_fallback_is_mapped(self, post, fetch):
+        cache = MemoryCache()
+        rules = build_rules(cache, ttl=None, map_ttl=None)
+        wcp = next(r.tool for r in rules if r.matches("WCP-9999", False))._tool
+        fetch.side_effect = [requests.HTTPError("HTTP 404", response=mock.Mock(status_code=404))]
+        post.return_value = _resp(200, {"data": {"search": {"nodes": [_node("odd-handle", ["WCP-9999"])]}}})
+        r, e = wcp.search("WCP-9999")
+        self.assertEqual(r["url"], "https://wcproducts.com/products/odd-handle")
+        self.assertEqual(UrlMap(cache).get("https://wcproducts.com", "WCP-9999"),
+                         "https://wcproducts.com/products/odd-handle")
+
+
+class CacheFlagsTest(unittest.TestCase):
+    def _args(self, **kw):
+        ns = dict(cache_file=None, no_cache=False,
+                  cache_ttl=main.DEFAULT_CACHE_TTL_HOURS, map_ttl=main.DEFAULT_MAP_TTL_HOURS)
+        ns.update(kw)
+        return argparse.Namespace(**ns)
+
+    def test_defaults(self):
+        cache, ttl, map_ttl = main._make_cache(self._args())
+        self.assertIsNone(cache)
+        self.assertEqual(ttl, 600)
+        self.assertEqual(map_ttl, 7 * 86400)
+
+    def test_serve_defaults_to_memory_cache(self):
+        cache, _, _ = main._make_cache(self._args(), default_memory=True)
+        self.assertIsInstance(cache, MemoryCache)
+
+    def test_no_cache_wins_over_serve_default(self):
+        cache, _, _ = main._make_cache(self._args(no_cache=True), default_memory=True)
+        self.assertIsNone(cache)
+
+    def test_zero_ttl_means_never_expire(self):
+        _, ttl, map_ttl = main._make_cache(self._args(cache_ttl=0, map_ttl=0))
+        self.assertIsNone(ttl)
+        self.assertIsNone(map_ttl)
+
+    def test_no_cache_and_cache_file_conflict(self):
+        parser = argparse.ArgumentParser()
+        main._add_cache_args(parser)
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            parser.parse_args(["--no-cache", "--cache-file", "x.json"])
 
 
 class TwoLayerCacheTest(unittest.TestCase):

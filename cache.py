@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -51,8 +52,13 @@ class MemoryCache(ResultCache):
 
 
 class FileCache(ResultCache):
-    """JSON-file cache. Safe for concurrent threads: writes are serialized and
-    atomic (temp file + rename), and an unreadable file counts as an empty cache."""
+    """JSON-file cache. Safe for concurrent threads within ONE process: writes are
+    serialized and atomic (temp file + rename). Not safe across processes sharing a
+    file: each write replaces the whole file, so the last writer wins.
+
+    A file with invalid JSON counts as empty (and is overwritten by the next write).
+    Any other read error (permissions, I/O) is raised and the file is left untouched,
+    so a transient fault can never wipe the cache."""
 
     def __init__(self, path):
         self._path = pathlib.Path(path)
@@ -64,8 +70,8 @@ class FileCache(ResultCache):
                 data = json.load(f)
         except FileNotFoundError:
             return {}
-        except (OSError, ValueError) as e:
-            log.warning("cache file %s unreadable (%s); treating as empty", self._path, e)
+        except ValueError as e:
+            log.warning("cache file %s is not valid JSON (%s); treating as empty", self._path, e)
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -74,6 +80,12 @@ class FileCache(ResultCache):
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f)
+            # mkstemp makes 0600 files; keep the existing file's mode (0644 for a new one).
+            try:
+                mode = stat.S_IMODE(self._path.stat().st_mode)
+            except FileNotFoundError:
+                mode = 0o644
+            os.chmod(tmp, mode)
             os.replace(tmp, self._path)
         except BaseException:
             try:
