@@ -12,4 +12,4 @@ USER app
 
 ENV PORT=8000
 
-CMD ["sh", "-c", "python main.py serve --port ${PORT}"]
+CMD ["python", "main.py", "serve"]
