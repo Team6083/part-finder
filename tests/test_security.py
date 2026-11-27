@@ -380,5 +380,32 @@ class CatalogBuildTest(unittest.TestCase):
             self.assertEqual(fp.call_count, 2)
 
 
+class UpcServerTest(unittest.TestCase):
+    """UPC lookups through the server: store errors map to the fixed client messages."""
+
+    def setUp(self):
+        self.client = TestClient(create_app(cache=MemoryCache()))
+        self.addCleanup(set_allowed_hosts, None)
+
+    def _get(self, code, **search_upc):
+        with mock.patch("tools.BigCommerceSearchTool.search_upc", **search_upc):
+            return self.client.get("/api/v1/lookup", params={"q": code}).json()
+
+    def test_hit(self):
+        hit = {"name": "NEO Vortex", "sku": "REV-21-1652", "price": "90.00", "in_stock": True,
+               "stock_status": "in_stock", "source": "json_ld", "url": "https://www.revrobotics.com/rev-21-1652/"}
+        body = self._get("722787604379", side_effect=[(None, "UPC 722787604379 not found on g"), (hit, None)])
+        self.assertEqual((body[0]["status"], body[0]["sku"]), ("ok", "REV-21-1652"))
+
+    def test_miss_everywhere_is_not_found(self):
+        body = self._get("722787600000", return_value=(None, "UPC mismatch: 722787600000 not found in search results"))
+        self.assertEqual(body[0]["error"], "not found")
+
+    def test_store_failure_is_upstream_error(self):
+        body = self._get("722787600001", side_effect=[(None, "UPC 722787600001 not found on g"),
+                                                       (None, "Read timed out")])
+        self.assertEqual(body[0]["error"], "upstream error")
+
+
 if __name__ == "__main__":
     unittest.main()

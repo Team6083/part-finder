@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, StringConstraints, create_model
 from cache import ResultCache
 from parsers import set_allowed_hosts
 from rules import UnsupportedInput, allowed_hosts, build_rules, resolve
+from tools import is_miss
 
 log = logging.getLogger(__name__)
 
@@ -34,10 +35,7 @@ QueryStr = Annotated[str, StringConstraints(max_length=MAX_QUERY_LEN)]
 
 def _public_error(error: str) -> str:
     """Fixed client-facing message; the real text stays in the server log."""
-    low = error.lower()
-    if "not found" in low or "no variants" in low or "no json-ld" in low or "mismatch" in low:
-        return "not found"
-    return "upstream error"
+    return "not found" if is_miss(error) else "upstream error"
 
 
 def create_app(cache: ResultCache | None = None, ttl: float | None = None,
@@ -81,7 +79,7 @@ def create_app(cache: ResultCache | None = None, ttl: float | None = None,
     router = APIRouter(dependencies=[Depends(require_key)])
 
     @router.get("/lookup", response_model=List[LookupResult])
-    def lookup(q: str = Query(..., max_length=MAX_QUERY_LEN, description="SKU or product URL")):
+    def lookup(q: str = Query(..., max_length=MAX_QUERY_LEN, description="SKU, UPC/EAN barcode, or product URL")):
         """Look up a part by SKU or URL. Returns all variants if a URL is given."""
         return _lookup(q)
 
