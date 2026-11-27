@@ -544,10 +544,14 @@ class BigCommerceSearchTool(SearchTool):
     def _variant(self, url, pid, name, attr, value, label, upc=None):
         endpoint = f"{self.base}/remote/v1/product-attributes/{pid}"
         _check_url(endpoint)
-        r = requests.post(endpoint, headers=HEADERS, timeout=10,
+        r = requests.post(endpoint, headers=HEADERS, timeout=10, allow_redirects=False, stream=True,
                           data={"action": "add", "product_id": pid, "qty[]": 1,
                                 f"attribute[{attr}]": value})
+        if 300 <= r.status_code < 400:
+            r.close()
+            raise FetchError(f"unexpected redirect from {endpoint}")
         r.raise_for_status()
+        read_capped(r, MAX_BODY_BYTES)
         data = r.json().get("data")
         # An unknown or partial selection comes back 200 with sku None (or data []): not a variant.
         label_sku = self._label_sku(label)
@@ -568,12 +572,14 @@ class BigCommerceSearchTool(SearchTool):
             "url":          url,
         }
 
-    def _variants(self, url, html, sku=None, upc=None):
+    def _variants(self, url, html, sku=None, upc=None, deadline=None):
         """Variants of an option-based product page; only the one matching sku or upc if given.
 
-        Only options whose label carries a SKU are queried. With a sku or upc, errors propagate
-        so the caller can tell a transient failure from a missing SKU; when listing a page, a
-        failing option is skipped. A upc stops at the first option whose UPC matches.
+        Only options whose label carries a SKU are queried. With a sku, errors propagate so the
+        caller can tell a transient failure from a missing SKU; when listing a page, a failing
+        option is skipped. A upc queries the options in turn and stops at the first whose UPC
+        matches; a failing option is skipped, and the error is raised only if nothing matched.
+        Past ``deadline`` (time.monotonic()) no further option is queried: UpcBudgetExceeded.
         """
         pid, name, options = self._options(html)
         if not pid or not pid.isdigit():
@@ -589,23 +595,28 @@ class BigCommerceSearchTool(SearchTool):
             log.warning("%s: %s lists %d variants; showing the first %d",
                         self.name, url, len(labelled), self.MAX_VARIANTS)
             labelled = labelled[:self.MAX_VARIANTS]
-        out = []
+        out, failure = [], None
         for attr, value, label, _ in labelled:
+            check_deadline(deadline)
             try:
                 variant = self._variant(url, pid, name, attr, value, label, upc)
             except Exception as e:
-                if sku or upc:
+                if sku:
                     raise
+                failure = e
                 log.debug("%s: skipping option %s on %s (%s)", self.name, label, url, e)
                 continue
             if variant:
                 out.append(variant)
                 if upc:
                     break
+        if upc and not out and failure:
+            raise failure
         return out
 
-    def _product_by_upc(self, product_url, upc):
+    def _product_by_upc(self, product_url, upc, deadline=None):
         """Fetch a product page and return the variant whose UPC is upc, or None."""
+        check_deadline(deadline)
         r = _fetch(product_url)
         try:
             results = parse_json_ld(product_url, r.text)
@@ -619,11 +630,16 @@ class BigCommerceSearchTool(SearchTool):
             if match:
                 return match
         # Option-based page: each variant has its own UPC, only reachable per option.
-        variants = self._variants(product_url, r.text, upc=upc)
+        variants = self._variants(product_url, r.text, upc=upc, deadline=deadline)
         if variants:
             return variants[0]
+        # The page's UPC matched but its SKU isn't in the JSON-LD. Trust the single JSON-LD
+        # entry only if it is a real SKU or the page has no options; otherwise it is the base
+        # product (REV option pages list the numeric product id), not the barcode's variant.
         if page_match and len(results) == 1:
-            return results[0]
+            only_sku = str(results[0]["sku"])
+            if (only_sku and not only_sku.isdigit()) or not self._options(r.text)[2]:
+                return results[0]
         if not results and not attrs:
             raise NoProductError("No JSON-LD Product found")
         return None
@@ -674,16 +690,21 @@ class BigCommerceSearchTool(SearchTool):
             return None, str(e)
 
     def search(self, sku):
-        direct = None
-        if self._url_fn:
-            direct = self._url_fn(sku)
+        direct = self._url_fn(sku) if self._url_fn else None
         return self._find(sku, "SKU", sku, lambda url: self._product(url, sku), direct)
 
-    def search_upc(self, upc):
-        """Look up a UPC (as normalized by normalize_upc) via the store search."""
-        return self._find(upc, "UPC", f"UPC:{upc}", lambda url: self._product_by_upc(url, upc))
+    def search_upc(self, upc, deadline=None):
+        """Look up a UPC (as normalized by normalize_upc) via the store search.
 
-    def _find(self, query, kind, map_key, product_match, direct_url=None):
+        ``deadline`` (time.monotonic()) stops further requests once passed."""
+        try:
+            check_deadline(deadline)
+        except UpcBudgetExceeded as e:
+            return None, str(e)
+        return self._find(upc, "UPC", f"UPC:{upc}",
+                          lambda url: self._product_by_upc(url, upc, deadline), deadline=deadline)
+
+    def _find(self, query, kind, map_key, product_match, direct_url=None, deadline=None):
         """URL map, then the direct page guess, then the store search for ``query``.
 
         ``product_match(url)`` returns the matching variant on a product page or None.
@@ -703,6 +724,7 @@ class BigCommerceSearchTool(SearchTool):
                 log.debug("%s: no direct page for %s (%s); searching", self.name, query, e)
 
         try:
+            check_deadline(deadline)
             r = _fetch(f"{self.base}/search.php?search_query={query}")
         except Exception as e:
             return None, str(e)
@@ -722,6 +744,8 @@ class BigCommerceSearchTool(SearchTool):
             log.debug("%s: search page candidate %s", self.name, product_url)
             try:
                 match = product_match(product_url)
+            except UpcBudgetExceeded as e:
+                return None, str(e)
             except Exception as e:
                 err = str(e)
                 continue
@@ -732,6 +756,15 @@ class BigCommerceSearchTool(SearchTool):
                     self._url_map.set(self.base, map_key, product_url)
                 return match, None
         return None, (None if checked else err) or f"{kind} mismatch: {query} not found in search results"
+
+
+class UpcBudgetExceeded(RuntimeError):
+    """A UPC lookup used up its time budget before finding a match."""
+
+
+def check_deadline(deadline) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise UpcBudgetExceeded("UPC lookup time budget exceeded")
 
 
 def normalize_upc(code: str) -> str:
@@ -759,10 +792,19 @@ class UpcTool(SearchTool):
     Stores are tried in order and the first exact UPC match wins. A miss everywhere
     reports "not found"; if any store failed (timeout, 5xx) that error is reported
     instead, since the product may be on that store.
+
+    One lookup may probe several candidate pages and every option on them, so it gets a
+    time budget (``budget`` seconds, env PART_FINDER_UPC_BUDGET, default 30). Once it is
+    spent no new request starts; a request already in flight still runs to its own timeout.
     """
 
-    def __init__(self, stores):
+    DEFAULT_BUDGET = 30.0
+
+    def __init__(self, stores, budget: float | None = None):
         self._stores = list(stores)
+        if budget is None:
+            budget = float(os.environ.get("PART_FINDER_UPC_BUDGET", self.DEFAULT_BUDGET))
+        self._budget = budget
 
     @property
     def name(self) -> str:
@@ -770,9 +812,10 @@ class UpcTool(SearchTool):
 
     def search(self, code):
         upc = normalize_upc(code)
+        deadline = time.monotonic() + self._budget
         failures = []
         for store in self._stores:
-            result, err = store.search_upc(upc)
+            result, err = store.search_upc(upc, deadline)
             if result:
                 log.debug("%s: UPC %s found by %s", self.name, upc, store.name)
                 return result, None

@@ -11,7 +11,7 @@ import tempfile
 import main
 from cache import MemoryCache, FileCache, UrlMap
 from rules import build_rules, resolve
-from parsers import format_cents, parse_shopify_rest
+from parsers import FetchError, format_cents, parse_shopify_rest
 from tools import (
     CachedTool, ShopifyCatalogTool, ShopifyStorefrontTool, BigCommerceSearchTool,
     UpcTool, normalize_upc, same_upc,
@@ -344,7 +344,89 @@ class UpcTest(unittest.TestCase):
         b.search_upc.return_value = ({"sku": "REV-21-1652"}, None)
         r, e = UpcTool([a, b]).search("0722787604379")
         self.assertEqual(r["sku"], "REV-21-1652")
-        a.search_upc.assert_called_once_with("722787604379")
+        self.assertEqual(a.search_upc.call_args.args[0], "722787604379")
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_failing_option_does_not_hide_a_later_match(self, fetch, post):
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("c")), mock.Mock(text=self.VARIANTS)]
+        post.side_effect = [requests.Timeout("slow"), self._api("REV-21-2110", "722787607332")]
+        r, e = BigCommerceSearchTool("https://r.com").search_upc("722787607332")
+        self.assertIsNone(e)
+        self.assertEqual(r["sku"], "REV-21-2110")
+
+    @mock.patch("tools.requests.post", side_effect=requests.Timeout("slow"))
+    @mock.patch("tools._fetch")
+    def test_all_options_failing_is_an_error_not_a_miss(self, fetch, post):
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("c")), mock.Mock(text=self.VARIANTS)]
+        r, e = BigCommerceSearchTool("https://r.com").search_upc("722787607332")
+        self.assertIsNone(r)
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("slow", e)
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_option_page_never_falls_back_to_the_base_product(self, fetch, post):
+        # Page UPC matches the default variant, but its SKU isn't in the JSON-LD (numeric id)
+        # and no option answers with that UPC: not a match, not {"sku": 820}.
+        page = self.VARIANTS.replace('"sku":"REV-21-2108","upc"', '"sku":"REV-X","upc"')
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("c")), mock.Mock(text=page)]
+        post.side_effect = [self._api("REV-21-2108", "1"), self._api("REV-21-2110", "2")]
+        r, e = BigCommerceSearchTool("https://r.com").search_upc("722787607325")
+        self.assertIsNone(r)
+        self.assertIn("mismatch", e)
+
+    @mock.patch("tools._fetch")
+    def test_real_json_ld_sku_is_used_when_page_upc_matches(self, fetch):
+        page = self._single("REV-21-1652", "722787604379").replace(
+            '"product_attributes":{"sku":"REV-21-1652"', '"product_attributes":{"sku":"OTHER"')
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("p")), mock.Mock(text=page)]
+        r, _ = BigCommerceSearchTool("https://r.com").search_upc("722787604379")
+        self.assertEqual(r["sku"], "REV-21-1652")
+
+    def test_page_attributes_missing_or_broken(self):
+        pa = BigCommerceSearchTool._page_attributes
+        self.assertEqual(pa("<html></html>"), {})
+        self.assertEqual(pa("<script>var BCData = {broken</script>"), {})
+        self.assertEqual(pa('<script>var BCData = {"product_attributes": []};</script>'), {})
+        self.assertEqual(pa('<script>var BCData = {"product_attributes":{"upc":"1"}};</script>'), {"upc": "1"})
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_spent_budget_stops_option_probing(self, fetch, post):
+        now = [0]
+        pages = iter([self.SEARCH.format("c"), self.VARIANTS])
+
+        def slow_fetch(url):
+            text = next(pages)
+            if text is self.VARIANTS:
+                now[0] = 100  # the product page took us past the deadline
+            return mock.Mock(text=text)
+
+        fetch.side_effect = slow_fetch
+        with mock.patch("tools.time.monotonic", side_effect=lambda: now[0]):
+            r, e = BigCommerceSearchTool("https://r.com").search_upc("722787607332", deadline=10)
+        self.assertIsNone(r)
+        self.assertIn("budget", e)
+        post.assert_not_called()
+
+    def test_upc_tool_budget_skips_remaining_stores(self):
+        a, b = mock.Mock(), mock.Mock()
+        a.name, b.name = "a", "b"
+        a.search_upc.return_value = (None, "UPC lookup time budget exceeded")
+        b.search_upc.side_effect = lambda upc, deadline: BigCommerceSearchTool("https://b").search_upc(upc, deadline)
+        with mock.patch("tools._fetch") as fetch:
+            _, e = UpcTool([a, b], budget=-1).search("722787604379")
+            fetch.assert_not_called()
+        self.assertIn("budget", e)
+        self.assertNotIn("not found", e)
+
+    @mock.patch("tools.requests.post")
+    def test_option_post_refuses_redirects(self, post):
+        post.return_value = _resp(302)
+        with self.assertRaises(FetchError):
+            BigCommerceSearchTool("https://r.com")._variant("u", "820", "n", "422", "1", "A (REV-21-2108)")
+        self.assertFalse(post.call_args.kwargs["allow_redirects"])
 
     def test_upc_tool_reports_failure_over_miss(self):
         a, b = mock.Mock(), mock.Mock()

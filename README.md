@@ -140,6 +140,7 @@ The unversioned `/lookup` paths still work for existing callers but are deprecat
 |---|---|
 | `PART_FINDER_API_KEY` | If set, every lookup call must send `X-API-Key: <value>` (constant-time compare), else 401. Unset = no auth. |
 | `PART_FINDER_MAX_BATCH` | Max queries per batch lookup (default 50); more returns 422. |
+| `PART_FINDER_UPC_BUDGET` | Seconds one UPC lookup may spend across stores before it stops starting new requests (default 30); a timeout returns `upstream error`. |
 | `PART_FINDER_CACHE_MAX_ENTRIES` | Max entries in the in-memory cache, evicted least recently used (default 10000). |
 
 Queries are limited to 2048 characters. Only the store hosts from `rules.py` are fetched
@@ -175,11 +176,14 @@ capped at 5 MB. Error messages to clients are fixed strings (`not found`, `unsup
 | `REV-XX-XXXX` | [REV Robotics](https://www.revrobotics.com) | JSON-LD (SKU = URL handle) |
 | `TTB-XXXX` | [ThriftyBot](https://www.thethriftybot.com) | Shopify Storefront search, catalog fallback |
 | `XXXX-XXXX-XXXX` | [goBILDA](https://www.gobilda.com) | BigCommerce search + JSON-LD |
-| `XXXXXXXXXXXX` (12–14 digits) | UPC / EAN barcode: goBILDA, then REV Robotics | BigCommerce search by UPC, verified against the page's UPC (per option for variant pages) |
+| `XXXXXXXXXXXX` (12–14 digits) | UPC / EAN barcode: goBILDA, then REV Robotics | BigCommerce search by UPC, verified against the page's UPC (and, on REV variant pages, each option's UPC) |
 
 UPC lookup only covers goBILDA and REV Robotics. AndyMark and ThriftyBot have no barcodes
 set on their products. WCP does set Shopify variant barcodes, but UPC lookup there isn't implemented yet.
-13- and 14-digit codes with leading zeros are reduced to the 12-digit UPC-A before searching.
+On goBILDA, only the UPC of a page's default variant is found: its option labels carry no
+SKU, so options are not queried. 13- and 14-digit codes with leading zeros are reduced to the
+12-digit UPC-A before searching. One UPC lookup can check several candidate pages and each of
+their options, so it stops starting new requests after `PART_FINDER_UPC_BUDGET` seconds (default 30).
 With a cache, the UPC → product page mapping goes in the URL map like SKUs do.
 
 Direct URLs from any supported store are also accepted.
