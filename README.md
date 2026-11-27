@@ -140,7 +140,7 @@ The unversioned `/lookup` paths still work for existing callers but are deprecat
 |---|---|
 | `PART_FINDER_API_KEY` | If set, every lookup call must send `X-API-Key: <value>` (constant-time compare), else 401. Unset = no auth. |
 | `PART_FINDER_MAX_BATCH` | Max queries per batch lookup (default 50); more returns 422. |
-| `PART_FINDER_UPC_BUDGET` | Seconds one UPC lookup may spend across stores before it stops starting new requests (default 30); a timeout returns `upstream error`. |
+| `PART_FINDER_UPC_BUDGET` | Seconds one UPC lookup may spend across stores before it stops starting new requests (default 30); a timeout returns `upstream error`. Must be a positive number, else startup fails. |
 | `PART_FINDER_CACHE_MAX_ENTRIES` | Max entries in the in-memory cache, evicted least recently used (default 10000). |
 
 Queries are limited to 2048 characters. Only the store hosts from `rules.py` are fetched
@@ -184,6 +184,8 @@ On goBILDA, only the UPC of a page's default variant is found: its option labels
 SKU, so options are not queried. 13- and 14-digit codes with leading zeros are reduced to the
 12-digit UPC-A before searching. One UPC lookup can check several candidate pages and each of
 their options, so it stops starting new requests after `PART_FINDER_UPC_BUDGET` seconds (default 30).
+With a cache, a UPC that no store has is remembered as `not found` for 10 minutes, so repeating it
+doesn't search both stores again. Upstream failures (timeouts, budget) are never cached.
 With a cache, the UPC → product page mapping goes in the URL map like SKUs do.
 
 Direct URLs from any supported store are also accepted.

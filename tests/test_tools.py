@@ -377,9 +377,19 @@ class UpcTest(unittest.TestCase):
         self.assertIn("mismatch", e)
 
     @mock.patch("tools._fetch")
-    def test_real_json_ld_sku_is_used_when_page_upc_matches(self, fetch):
+    def test_json_ld_of_another_variant_is_not_returned(self, fetch):
+        # BCData says the UPC belongs to OTHER; the JSON-LD shows REV-21-1652: not a match.
         page = self._single("REV-21-1652", "722787604379").replace(
             '"product_attributes":{"sku":"REV-21-1652"', '"product_attributes":{"sku":"OTHER"')
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("p")), mock.Mock(text=page)]
+        r, e = BigCommerceSearchTool("https://r.com").search_upc("722787604379")
+        self.assertIsNone(r)
+        self.assertIn("mismatch", e)
+
+    @mock.patch("tools._fetch")
+    def test_json_ld_is_used_when_bcdata_names_no_sku(self, fetch):
+        page = self._single("REV-21-1652", "722787604379").replace(
+            '"product_attributes":{"sku":"REV-21-1652"', '"product_attributes":{"sku":null')
         fetch.side_effect = [mock.Mock(text=self.SEARCH.format("p")), mock.Mock(text=page)]
         r, _ = BigCommerceSearchTool("https://r.com").search_upc("722787604379")
         self.assertEqual(r["sku"], "REV-21-1652")
@@ -415,8 +425,10 @@ class UpcTest(unittest.TestCase):
         a.name, b.name = "a", "b"
         a.search_upc.return_value = (None, "UPC lookup time budget exceeded")
         b.search_upc.side_effect = lambda upc, deadline: BigCommerceSearchTool("https://b").search_upc(upc, deadline)
-        with mock.patch("tools._fetch") as fetch:
-            _, e = UpcTool([a, b], budget=-1).search("722787604379")
+        clock = iter([0] + [100] * 10)  # the budget is spent by the time b starts
+        with mock.patch("tools._fetch") as fetch, \
+                mock.patch("tools.time.monotonic", side_effect=lambda: next(clock)):
+            _, e = UpcTool([a, b], budget=1).search("722787604379")
             fetch.assert_not_called()
         self.assertIn("budget", e)
         self.assertNotIn("not found", e)
@@ -428,6 +440,18 @@ class UpcTest(unittest.TestCase):
             BigCommerceSearchTool("https://r.com")._variant("u", "820", "n", "422", "1", "A (REV-21-2108)")
         self.assertFalse(post.call_args.kwargs["allow_redirects"])
 
+    def test_budget_validation(self):
+        for bad in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                UpcTool([], budget=bad)
+        for env, want in (("", UpcTool.DEFAULT_BUDGET), ("12.5", 12.5)):
+            with mock.patch.dict("os.environ", {"PART_FINDER_UPC_BUDGET": env}):
+                self.assertEqual(UpcTool([])._budget, want)
+        for env in ("abc", "0", "nan"):
+            with mock.patch.dict("os.environ", {"PART_FINDER_UPC_BUDGET": env}), \
+                    self.assertRaises(ValueError):
+                UpcTool([])
+
     def test_upc_tool_reports_failure_over_miss(self):
         a, b = mock.Mock(), mock.Mock()
         a.name, b.name = "a", "b"
@@ -438,6 +462,48 @@ class UpcTest(unittest.TestCase):
         b.search_upc.return_value = (None, "UPC 722787604379 not found on https://b")
         _, e = UpcTool([a, b]).search("722787604379")
         self.assertEqual(e, "UPC 722787604379 not found")
+
+
+class MissCacheTest(unittest.TestCase):
+    """CachedTool(miss_ttl=...) remembers misses, never upstream failures."""
+
+    def _tool(self, *answers, miss_ttl=600):
+        inner = mock.Mock()
+        inner.name = "inner"
+        inner.search.side_effect = list(answers)
+        return inner, CachedTool(inner, MemoryCache(), ttl=600, miss_ttl=miss_ttl)
+
+    def test_miss_is_cached(self):
+        inner, tool = self._tool((None, "UPC 722787600000 not found"))
+        self.assertEqual(tool.search("722787600000"), (None, "UPC 722787600000 not found"))
+        self.assertEqual(tool.search("722787600000"), (None, "UPC 722787600000 not found"))
+        self.assertEqual(inner.search.call_count, 1)
+
+    def test_upstream_error_is_not_cached(self):
+        inner, tool = self._tool((None, "Read timed out"), ({"sku": "X"}, None))
+        tool.search("722787600000")
+        self.assertEqual(tool.search("722787600000"), ({"sku": "X"}, None))
+        self.assertEqual(inner.search.call_count, 2)
+
+    def test_misses_not_cached_without_miss_ttl(self):
+        inner, tool = self._tool((None, "SKU X not found"), (None, "SKU X not found"), miss_ttl=None)
+        tool.search("X")
+        tool.search("X")
+        self.assertEqual(inner.search.call_count, 2)
+
+    def test_miss_expires(self):
+        inner, tool = self._tool((None, "UPC 1 not found"), ({"sku": "X"}, None))
+        with mock.patch("cache.time.time", return_value=1000):
+            tool.search("1")
+        with mock.patch("cache.time.time", return_value=1000 + 601):
+            self.assertEqual(tool.search("1"), ({"sku": "X"}, None))
+
+    def test_upc_rule_caches_misses_sku_rules_do_not(self):
+        rules = build_rules(MemoryCache())
+        upc_tool = resolve("722787604379", rules, allow_generic=False)[0].__self__
+        sku_tool = resolve("REV-21-1652", rules, allow_generic=False)[0].__self__
+        self.assertTrue(upc_tool._miss_ttl)
+        self.assertIsNone(sku_tool._miss_ttl)
 
 
 class BigCommerceVariantEdgeTest(unittest.TestCase):

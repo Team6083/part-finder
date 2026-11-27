@@ -380,10 +380,6 @@ class CatalogBuildTest(unittest.TestCase):
             self.assertEqual(fp.call_count, 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class UpcServerTest(unittest.TestCase):
     """UPC lookups through the server: store errors map to the fixed client messages."""
 
@@ -409,3 +405,7 @@ class UpcServerTest(unittest.TestCase):
         body = self._get("722787600001", side_effect=[(None, "UPC 722787600001 not found on g"),
                                                        (None, "Read timed out")])
         self.assertEqual(body[0]["error"], "upstream error")
+
+
+if __name__ == "__main__":
+    unittest.main()

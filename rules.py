@@ -11,6 +11,8 @@ from tools import (
 log = logging.getLogger(__name__)
 
 
+UPC_MISS_TTL = 600  # seconds a UPC that no store has is remembered as "not found"
+
 _SAFE_SKU = re.compile(r"[\w.\-]+")
 
 
@@ -59,8 +61,8 @@ def build_rules(
     # long-lived SKU -> product URL mappings that skip the search step.
     url_map = UrlMap(cache, map_ttl) if cache else None
 
-    def w(tool, cacheable=True):
-        return CachedTool(tool, cache, ttl) if (cache and cacheable) else tool
+    def w(tool, cacheable=True, miss_ttl=None):
+        return CachedTool(tool, cache, ttl, miss_ttl) if (cache and cacheable) else tool
 
     def storefront(base):
         # Storefront search first; the old full-catalog crawl is the last resort.
@@ -84,7 +86,8 @@ def build_rules(
              sku(r"^\d{4}-\d{4}-\d{4}$"), domain("gobilda.com")),
         # UPC-A / EAN-13 / GTIN-14 barcodes. Only the BigCommerce stores expose a UPC to search by;
         # goBILDA first since REV's search is much slower.
-        Rule(w(UpcTool([gobilda, rev])),
+        # A miss is remembered for UPC_MISS_TTL: an unknown barcode costs a full search of both stores.
+        Rule(w(UpcTool([gobilda, rev]), miss_ttl=UPC_MISS_TTL),
              sku(r"^\d{12,14}$")),
     ]
 

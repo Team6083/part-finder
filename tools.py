@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -79,13 +80,28 @@ def normalize_url(url: str) -> str:
     return urlunparse((p.scheme.lower(), p.netloc.rpartition("@")[2].lower(), p.path, "", "", ""))
 
 
-class CachedTool(SearchTool):
-    """Decorator: wraps any SearchTool with a result cache and optional TTL."""
+def is_miss(error: str | None) -> bool:
+    """Whether a tool's error means the item isn't there (vs. a fetch/upstream failure)."""
+    low = (error or "").lower()
+    return any(s in low for s in ("not found", "no variants", "no json-ld", "mismatch"))
 
-    def __init__(self, tool: SearchTool, cache: ResultCache, ttl: float | None = None):
+
+class CachedTool(SearchTool):
+    """Decorator: wraps any SearchTool with a result cache and optional TTL.
+
+    With ``miss_ttl``, a miss (``is_miss``) is also remembered for that many seconds, so
+    repeating an unknown query doesn't redo an expensive lookup. Upstream failures are
+    never cached.
+    """
+
+    MISS_PREFIX = "miss:"
+
+    def __init__(self, tool: SearchTool, cache: ResultCache, ttl: float | None = None,
+                 miss_ttl: float | None = None):
         self._tool = tool
         self._cache = cache
         self._ttl = ttl
+        self._miss_ttl = miss_ttl
 
     @property
     def name(self) -> str:
@@ -100,14 +116,28 @@ class CachedTool(SearchTool):
         if hit is not None:
             log.debug("%s: cache hit for %s", self.name, key)
             return hit, None
+        if self._miss_ttl:
+            try:
+                miss = self._cache.get(self.MISS_PREFIX + key, self._miss_ttl)
+            except Exception as e:
+                log.warning("%s: cache read failed (%s); treating as a miss", self.name, e)
+                miss = None
+            if miss is not None:
+                log.debug("%s: cached not-found for %s", self.name, key)
+                return None, miss["error"]
         log.debug("%s: cache miss for %s", self.name, key)
         result, error = fn()
         if result:
-            try:
-                self._cache.set(key, result)
-            except Exception as e:
-                log.warning("%s: cache write failed (%s); continuing", self.name, e)
+            self._write(key, result)
+        elif self._miss_ttl and is_miss(error):
+            self._write(self.MISS_PREFIX + key, {"error": error})
         return result, error
+
+    def _write(self, key, value):
+        try:
+            self._cache.set(key, value)
+        except Exception as e:
+            log.warning("%s: cache write failed (%s); continuing", self.name, e)
 
     def search(self, query):
         return self._cached(query, lambda: self._tool.search(query))
@@ -633,10 +663,11 @@ class BigCommerceSearchTool(SearchTool):
         variants = self._variants(product_url, r.text, upc=upc, deadline=deadline)
         if variants:
             return variants[0]
-        # The page's UPC matched but its SKU isn't in the JSON-LD. Trust the single JSON-LD
-        # entry only if it is a real SKU or the page has no options; otherwise it is the base
-        # product (REV option pages list the numeric product id), not the barcode's variant.
-        if page_match and len(results) == 1:
+        # The page's UPC matched but BCData names no SKU. Trust the single JSON-LD entry only
+        # if it is a real SKU or the page has no options; otherwise it is the base product
+        # (REV option pages list the numeric product id), not the barcode's variant. When
+        # BCData does name a SKU that the JSON-LD lacks, the JSON-LD shows another variant.
+        if page_match and not attrs.get("sku") and len(results) == 1:
             only_sku = str(results[0]["sku"])
             if (only_sku and not only_sku.isdigit()) or not self._options(r.text)[2]:
                 return results[0]
@@ -803,7 +834,13 @@ class UpcTool(SearchTool):
     def __init__(self, stores, budget: float | None = None):
         self._stores = list(stores)
         if budget is None:
-            budget = float(os.environ.get("PART_FINDER_UPC_BUDGET", self.DEFAULT_BUDGET))
+            raw = os.environ.get("PART_FINDER_UPC_BUDGET", "")
+            try:
+                budget = float(raw) if raw.strip() else self.DEFAULT_BUDGET
+            except ValueError:
+                raise ValueError(f"PART_FINDER_UPC_BUDGET must be a number of seconds, got {raw!r}") from None
+        if not math.isfinite(budget) or budget <= 0:
+            raise ValueError(f"UPC lookup budget must be a positive number of seconds, got {budget!r}")
         self._budget = budget
 
     @property
@@ -819,8 +856,7 @@ class UpcTool(SearchTool):
             if result:
                 log.debug("%s: UPC %s found by %s", self.name, upc, store.name)
                 return result, None
-            low = (err or "").lower()
-            if err and "not found" not in low and "mismatch" not in low and "no json-ld" not in low:
+            if err and not is_miss(err):
                 failures.append(f"{store.name}: {err}")
         if failures:
             return None, "; ".join(failures)
