@@ -81,7 +81,7 @@ def create_app(cache: ResultCache | None = None, ttl: float | None = None,
     router = APIRouter(dependencies=[Depends(require_key)])
 
     @router.get("/lookup", response_model=List[LookupResult])
-    def lookup(q: str = Query(..., max_length=MAX_QUERY_LEN, description="SKU or product URL")):
+    def lookup(q: str = Query(..., max_length=MAX_QUERY_LEN, description="SKU, UPC/EAN barcode, or product URL")):
         """Look up a part by SKU or URL. Returns all variants if a URL is given."""
         return _lookup(q)
 

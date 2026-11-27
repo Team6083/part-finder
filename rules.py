@@ -5,7 +5,7 @@ from parsers import host_matches, url_host
 from tools import (
     SearchTool, CachedTool, GenericUrlTool,
     ShopifyHandleTool, ShopifyStorefrontTool, ShopifyCatalogTool,
-    JsonLdHandleTool, BigCommerceSearchTool,
+    JsonLdHandleTool, BigCommerceSearchTool, UpcTool,
 )
 
 log = logging.getLogger(__name__)
@@ -66,19 +66,26 @@ def build_rules(
         # Storefront search first; the old full-catalog crawl is the last resort.
         return ShopifyStorefrontTool(base, fallback=ShopifyCatalogTool(base), url_map=url_map)
 
+    rev = BigCommerceSearchTool("https://www.revrobotics.com", url_map=url_map,
+                                url_fn=lambda sku: f"https://www.revrobotics.com/{sku.lower()}/")
+    gobilda = BigCommerceSearchTool("https://www.gobilda.com", url_map=url_map)
+
     return [
         Rule(w(ShopifyHandleTool("https://wcproducts.com",
                                  fallback=ShopifyStorefrontTool("https://wcproducts.com", url_map=url_map))),
              sku(r"^wcp-\d+$"),            domain("wcproducts.com")),
         Rule(w(storefront("https://www.andymark.com")),
              sku(r"^am-\d+"),              domain("andymark.com")),
-        Rule(w(BigCommerceSearchTool("https://www.revrobotics.com", url_map=url_map,
-                                       url_fn=lambda sku: f"https://www.revrobotics.com/{sku.lower()}/")),
+        Rule(w(rev),
              sku(r"^rev-\d+-\d+"),         domain("revrobotics.com")),
         Rule(w(storefront("https://www.thethriftybot.com")),
              sku(r"^ttb-\d+"),             domain("thethriftybot.com")),
-        Rule(w(BigCommerceSearchTool("https://www.gobilda.com", url_map=url_map)),
+        Rule(w(gobilda),
              sku(r"^\d{4}-\d{4}-\d{4}$"), domain("gobilda.com")),
+        # UPC-A / EAN-13 / GTIN-14 barcodes. Only the BigCommerce stores expose a UPC to search by;
+        # goBILDA first since REV's search is much slower.
+        Rule(w(UpcTool([gobilda, rev])),
+             sku(r"^\d{12,14}$")),
     ]
 
 

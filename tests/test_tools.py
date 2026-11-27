@@ -10,10 +10,11 @@ import tempfile
 
 import main
 from cache import MemoryCache, FileCache, UrlMap
-from rules import build_rules
+from rules import build_rules, resolve
 from parsers import format_cents, parse_shopify_rest
 from tools import (
     CachedTool, ShopifyCatalogTool, ShopifyStorefrontTool, BigCommerceSearchTool,
+    UpcTool, normalize_upc, same_upc,
 )
 
 
@@ -247,6 +248,114 @@ class BigCommerceVariantTest(unittest.TestCase):
         self.assertEqual((r["sku"], r["price"], r["in_stock"], r["url"]),
                          ("REV-21-2108", "8.75", True, "https://r.com/c/"))
         self.assertEqual(post.call_args.kwargs["data"]["attribute[422]"], "1916")
+
+
+class UpcTest(unittest.TestCase):
+    SEARCH = ('<li class="product"><article class="card"><figure class="card-figure">'
+              '<a href="https://r.com/{}/?searchuuid=1">c</a></figure></article></li>')
+
+    @staticmethod
+    def _single(sku, upc):
+        return ('<script type="application/ld+json">{"@type":"Product","name":"Motor","sku":"%s",'
+                '"offers":{"price":"90","availability":"https://schema.org/InStock"}}</script>'
+                '<script type="text/javascript">\nvar BCData = {"product_attributes":'
+                '{"sku":"%s","upc":"%s","gtin":null,"stock":null}};\n</script>' % (sku, sku, upc))
+
+    VARIANTS = ('<h1>Couplers</h1><input name="product_id" value="820">'
+                '<label data-product-attribute-value="1" for="attribute_radio_422_1">A (REV-21-2108)</label>'
+                '<label data-product-attribute-value="2" for="attribute_radio_422_2">B (REV-21-2110)</label>'
+                '<script type="application/ld+json">{"@type":"Product","name":"Couplers","sku":820,'
+                '"offers":{"price":"8.75","url":"u"}}</script>'
+                '<script>var BCData = {"product_attributes":{"sku":"REV-21-2108","upc":"722787607325"}};</script>')
+
+    @staticmethod
+    def _api(sku, upc):
+        return _resp(200, {"data": {"sku": sku, "upc": upc, "instock": True,
+                                    "price": {"without_tax": {"value": 8.75}}}})
+
+    def test_normalize(self):
+        self.assertEqual(normalize_upc("722787604379"), "722787604379")
+        self.assertEqual(normalize_upc("0722787604379"), "722787604379")
+        self.assertEqual(normalize_upc("00722787604379"), "722787604379")
+        self.assertEqual(normalize_upc("4006381333931"), "4006381333931")
+        self.assertTrue(same_upc("0722787604379", "722787604379"))
+        self.assertFalse(same_upc(None, "722787604379"))
+
+    def test_routing(self):
+        rules = build_rules()
+        for code in ("722787604379", "0722787604379", "00722787604379"):
+            fn, q = resolve(code, rules, allow_generic=False)
+            self.assertIsInstance(fn.__self__, UpcTool)
+        fn, _ = resolve("1310-0016-4008", rules, allow_generic=False)
+        self.assertNotIsInstance(fn.__self__, UpcTool)
+
+    @mock.patch("tools._fetch")
+    def test_single_product_page(self, fetch):
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("rev-21-1652")),
+                             mock.Mock(text=self._single("REV-21-1652", "722787604379"))]
+        r, e = BigCommerceSearchTool("https://r.com").search_upc("722787604379")
+        self.assertIsNone(e)
+        self.assertEqual((r["sku"], r["url"]), ("REV-21-1652", "https://r.com/rev-21-1652/"))
+        self.assertIn("search_query=722787604379", fetch.call_args_list[0].args[0])
+
+    @mock.patch("tools._fetch")
+    def test_page_with_other_upc_is_a_mismatch(self, fetch):
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("x")),
+                             mock.Mock(text=self._single("REV-21-1652", "722787604379"))]
+        r, e = BigCommerceSearchTool("https://r.com").search_upc("722787600000")
+        self.assertIsNone(r)
+        self.assertIn("mismatch", e)
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_variant_matched_by_option_upc(self, fetch, post):
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("c")), mock.Mock(text=self.VARIANTS)]
+        post.side_effect = [self._api("REV-21-2108", "722787607325"), self._api("REV-21-2110", "722787607332")]
+        r, e = BigCommerceSearchTool("https://r.com").search_upc("722787607332")
+        self.assertIsNone(e)
+        self.assertEqual((r["sku"], r["source"]), ("REV-21-2110", "bigcommerce_variant"))
+
+    @mock.patch("tools.requests.post")
+    @mock.patch("tools._fetch")
+    def test_variant_stops_at_first_match(self, fetch, post):
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("c")), mock.Mock(text=self.VARIANTS)]
+        post.side_effect = [self._api("REV-21-2108", "722787607325")]
+        r, _ = BigCommerceSearchTool("https://r.com").search_upc("722787607325")
+        self.assertEqual(r["sku"], "REV-21-2108")
+        self.assertEqual(post.call_count, 1)
+
+    @mock.patch("tools._fetch")
+    def test_url_map_keyed_by_upc(self, fetch):
+        url_map = UrlMap(MemoryCache())
+        tool = BigCommerceSearchTool("https://r.com", url_map=url_map)
+        page = mock.Mock(text=self._single("REV-21-1652", "722787604379"))
+        fetch.side_effect = [mock.Mock(text=self.SEARCH.format("rev-21-1652")), page, page]
+        tool.search_upc("722787604379")
+        self.assertEqual(url_map.get("https://r.com", "UPC:722787604379"), "https://r.com/rev-21-1652/")
+        self.assertIsNone(url_map.get("https://r.com", "722787604379"))
+        r, _ = tool.search_upc("722787604379")
+        self.assertEqual(r["sku"], "REV-21-1652")
+        self.assertEqual(fetch.call_count, 3)  # second lookup skipped the search
+
+    def test_upc_tool_tries_stores_in_order(self):
+        a, b = mock.Mock(), mock.Mock()
+        a.name, b.name = "a", "b"
+        a.search_upc.return_value = (None, "UPC 722787604379 not found on https://a")
+        b.search_upc.return_value = ({"sku": "REV-21-1652"}, None)
+        r, e = UpcTool([a, b]).search("0722787604379")
+        self.assertEqual(r["sku"], "REV-21-1652")
+        a.search_upc.assert_called_once_with("722787604379")
+
+    def test_upc_tool_reports_failure_over_miss(self):
+        a, b = mock.Mock(), mock.Mock()
+        a.name, b.name = "a", "b"
+        a.search_upc.return_value = (None, "UPC mismatch: 1 not found in search results")
+        b.search_upc.return_value = (None, "Read timed out")
+        _, e = UpcTool([a, b]).search("722787604379")
+        self.assertIn("timed out", e)
+        b.search_upc.return_value = (None, "UPC 722787604379 not found on https://b")
+        _, e = UpcTool([a, b]).search("722787604379")
+        self.assertEqual(e, "UPC 722787604379 not found")
 
 
 class BigCommerceVariantEdgeTest(unittest.TestCase):

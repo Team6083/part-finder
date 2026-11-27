@@ -15,10 +15,13 @@ pip install -r requirements.txt
 
 ## CLI
 
-Reads one SKU or URL per line from stdin.
+Reads one SKU, UPC barcode, or URL per line from stdin.
 
 ```bash
 echo "WCP-1838" | python main.py
+
+# UPC-A (12 digits) or EAN-13 / GTIN-14 with leading zeros
+echo "722787604379" | python main.py
 
 printf "WCP-1838\nam-0255_15T\nREV-11-2159\n" | python main.py
 
@@ -115,6 +118,7 @@ python main.py serve --host 127.0.0.1 --port 8080 --cache-file cache.json
 **Single lookup**
 ```
 GET /api/v1/lookup?q=WCP-1838
+GET /api/v1/lookup?q=722787604379
 GET /api/v1/lookup?q=https://www.revrobotics.com/rev-11-2159/
 ```
 
@@ -171,6 +175,12 @@ capped at 5 MB. Error messages to clients are fixed strings (`not found`, `unsup
 | `REV-XX-XXXX` | [REV Robotics](https://www.revrobotics.com) | JSON-LD (SKU = URL handle) |
 | `TTB-XXXX` | [ThriftyBot](https://www.thethriftybot.com) | Shopify Storefront search, catalog fallback |
 | `XXXX-XXXX-XXXX` | [goBILDA](https://www.gobilda.com) | BigCommerce search + JSON-LD |
+| `XXXXXXXXXXXX` (12–14 digits) | UPC / EAN barcode: goBILDA, then REV Robotics | BigCommerce search by UPC, verified against the page's UPC (per option for variant pages) |
+
+UPC lookup only covers goBILDA and REV Robotics. AndyMark and ThriftyBot have no barcodes
+set on their products. WCP does set Shopify variant barcodes, but UPC lookup there isn't implemented yet.
+13- and 14-digit codes with leading zeros are reduced to the 12-digit UPC-A before searching.
+With a cache, the UPC → product page mapping goes in the URL map like SKUs do.
 
 Direct URLs from any supported store are also accepted.
 On the CLI, unknown URLs fall back to auto-detection (Shopify REST or JSON-LD). `serve` never

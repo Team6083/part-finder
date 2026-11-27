@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -527,7 +528,20 @@ class BigCommerceSearchTool(SearchTool):
         m = re.search(r"\(([A-Za-z]{2,}-\d[\w-]*)\)", label)
         return m[1] if m else None
 
-    def _variant(self, url, pid, name, attr, value, label):
+    @staticmethod
+    def _page_attributes(html):
+        """The page's ``BCData.product_attributes`` (sku, upc, ... of the default variant), or {}."""
+        m = re.search(r"var\s+BCData\s*=\s*", html)
+        if not m:
+            return {}
+        try:
+            data, _ = json.JSONDecoder().raw_decode(html, m.end())
+        except ValueError:
+            return {}
+        attrs = data.get("product_attributes") if isinstance(data, dict) else None
+        return attrs if isinstance(attrs, dict) else {}
+
+    def _variant(self, url, pid, name, attr, value, label, upc=None):
         endpoint = f"{self.base}/remote/v1/product-attributes/{pid}"
         _check_url(endpoint)
         r = requests.post(endpoint, headers=HEADERS, timeout=10,
@@ -539,6 +553,8 @@ class BigCommerceSearchTool(SearchTool):
         label_sku = self._label_sku(label)
         if not isinstance(data, dict) or not data.get("sku") or \
                 (label_sku and data["sku"].upper() != label_sku.upper()):
+            return None
+        if upc is not None and not same_upc(data.get("upc"), upc):
             return None
         price = ((data.get("price") or {}).get("without_tax") or {}).get("value", "")
         in_stock = bool(data.get("instock")) and data.get("purchasable", True) is not False
@@ -552,12 +568,12 @@ class BigCommerceSearchTool(SearchTool):
             "url":          url,
         }
 
-    def _variants(self, url, html, sku=None):
-        """Variants of an option-based product page; only the one matching sku if given.
+    def _variants(self, url, html, sku=None, upc=None):
+        """Variants of an option-based product page; only the one matching sku or upc if given.
 
-        Only options whose label carries a SKU are queried. With a sku, errors propagate so
-        the caller can tell a transient failure from a missing SKU; when listing a page, a
-        failing option is skipped.
+        Only options whose label carries a SKU are queried. With a sku or upc, errors propagate
+        so the caller can tell a transient failure from a missing SKU; when listing a page, a
+        failing option is skipped. A upc stops at the first option whose UPC matches.
         """
         pid, name, options = self._options(html)
         if not pid or not pid.isdigit():
@@ -576,15 +592,41 @@ class BigCommerceSearchTool(SearchTool):
         out = []
         for attr, value, label, _ in labelled:
             try:
-                variant = self._variant(url, pid, name, attr, value, label)
+                variant = self._variant(url, pid, name, attr, value, label, upc)
             except Exception as e:
-                if sku:
+                if sku or upc:
                     raise
                 log.debug("%s: skipping option %s on %s (%s)", self.name, label, url, e)
                 continue
             if variant:
                 out.append(variant)
+                if upc:
+                    break
         return out
+
+    def _product_by_upc(self, product_url, upc):
+        """Fetch a product page and return the variant whose UPC is upc, or None."""
+        r = _fetch(product_url)
+        try:
+            results = parse_json_ld(product_url, r.text)
+        except NoProductError:
+            results = []
+        attrs = self._page_attributes(r.text)
+        page_match = same_upc(attrs.get("upc"), upc)
+        if page_match and attrs.get("sku"):
+            page_sku = str(attrs["sku"]).upper()
+            match = next((v for v in results if str(v["sku"]).upper() == page_sku), None)
+            if match:
+                return match
+        # Option-based page: each variant has its own UPC, only reachable per option.
+        variants = self._variants(product_url, r.text, upc=upc)
+        if variants:
+            return variants[0]
+        if page_match and len(results) == 1:
+            return results[0]
+        if not results and not attrs:
+            raise NoProductError("No JSON-LD Product found")
+        return None
 
     def _product(self, product_url, sku):
         """Fetch a product page and return the variant matching sku, or None."""
@@ -632,29 +674,43 @@ class BigCommerceSearchTool(SearchTool):
             return None, str(e)
 
     def search(self, sku):
-        mapped = mapped_lookup(self._url_map, self.base, sku,
-                               lambda url: self._product(url, sku), self.name)
+        direct = None
+        if self._url_fn:
+            direct = self._url_fn(sku)
+        return self._find(sku, "SKU", sku, lambda url: self._product(url, sku), direct)
+
+    def search_upc(self, upc):
+        """Look up a UPC (as normalized by normalize_upc) via the store search."""
+        return self._find(upc, "UPC", f"UPC:{upc}", lambda url: self._product_by_upc(url, upc))
+
+    def _find(self, query, kind, map_key, product_match, direct_url=None):
+        """URL map, then the direct page guess, then the store search for ``query``.
+
+        ``product_match(url)`` returns the matching variant on a product page or None.
+        ``kind`` ("SKU" / "UPC") names the query in error messages; ``map_key`` keys the URL map entry.
+        """
+        mapped = mapped_lookup(self._url_map, self.base, map_key, product_match, self.name)
         if mapped:
             return mapped, None
 
-        if self._url_fn:
+        if direct_url:
             try:
-                match = self._product(self._url_fn(sku), sku)
+                match = product_match(direct_url)
                 if match:
-                    log.debug("%s: direct page hit for %s", self.name, sku)
+                    log.debug("%s: direct page hit for %s", self.name, query)
                     return match, None
             except Exception as e:
-                log.debug("%s: no direct page for %s (%s); searching", self.name, sku, e)
+                log.debug("%s: no direct page for %s (%s); searching", self.name, query, e)
 
         try:
-            r = _fetch(f"{self.base}/search.php?search_query={sku}")
+            r = _fetch(f"{self.base}/search.php?search_query={query}")
         except Exception as e:
             return None, str(e)
 
         # goBILDA links the card itself; REV links the figure inside it.
         cards = BeautifulSoup(r.text, "html.parser").select("li.product a.card, li.product .card-figure a[href]")
         if not cards:
-            return None, f"SKU {sku} not found on {self.base}"
+            return None, f"{kind} {query} not found on {self.base}"
 
         seen = []
         for card in cards:
@@ -665,14 +721,67 @@ class BigCommerceSearchTool(SearchTool):
         for product_url in seen[:self.MAX_SEARCH_CANDIDATES]:
             log.debug("%s: search page candidate %s", self.name, product_url)
             try:
-                match = self._product(product_url, sku)
+                match = product_match(product_url)
             except Exception as e:
                 err = str(e)
                 continue
             checked = True
             if match:
-                log.debug("%s: search page hit for %s", self.name, sku)
+                log.debug("%s: search page hit for %s", self.name, query)
                 if self._url_map:
-                    self._url_map.set(self.base, sku, product_url)
+                    self._url_map.set(self.base, map_key, product_url)
                 return match, None
-        return None, (None if checked else err) or f"SKU mismatch: {sku} not found in search results"
+        return None, (None if checked else err) or f"{kind} mismatch: {query} not found in search results"
+
+
+def normalize_upc(code: str) -> str:
+    """Digits of a UPC-A / EAN-13 / GTIN-14, with zero padding beyond 12 digits removed.
+
+    "0722787604379" and "00722787604379" both become "722787604379", the form stores search by.
+    """
+    digits = re.sub(r"\D", "", code)
+    while len(digits) > 12 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits
+
+
+def same_upc(a, b) -> bool:
+    """Whether two barcodes are the same GTIN, ignoring leading zero padding."""
+    if not a or not b:
+        return False
+    a, b = normalize_upc(str(a)), normalize_upc(str(b))
+    return bool(a) and a == b
+
+
+class UpcTool(SearchTool):
+    """UPC / EAN barcode lookup across stores that expose one (``search_upc``).
+
+    Stores are tried in order and the first exact UPC match wins. A miss everywhere
+    reports "not found"; if any store failed (timeout, 5xx) that error is reported
+    instead, since the product may be on that store.
+    """
+
+    def __init__(self, stores):
+        self._stores = list(stores)
+
+    @property
+    def name(self) -> str:
+        return f"UpcTool[{', '.join(s.name for s in self._stores)}]"
+
+    def search(self, code):
+        upc = normalize_upc(code)
+        failures = []
+        for store in self._stores:
+            result, err = store.search_upc(upc)
+            if result:
+                log.debug("%s: UPC %s found by %s", self.name, upc, store.name)
+                return result, None
+            low = (err or "").lower()
+            if err and "not found" not in low and "mismatch" not in low and "no json-ld" not in low:
+                failures.append(f"{store.name}: {err}")
+        if failures:
+            return None, "; ".join(failures)
+        return None, f"UPC {upc} not found"
+
+    def search_url(self, url):
+        return None, "UPC lookup does not take URLs"
